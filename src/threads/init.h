@@ -9,4 +9,7 @@
 /** Page directory with kernel mappings only. */
 extern uint32_t *init_page_dir;
 
+/** Kernel shell line buffer size */
+#define KS_BUFFER_SIZE 64
+
 #endif /**< threads/init.h */

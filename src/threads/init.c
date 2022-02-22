@@ -133,14 +133,104 @@ pintos_init (void)
     /* Run actions specified on kernel command line. */
     run_actions (argv);
   } else {
+
     // TODO: no command line passed to kernel. Run interactively 
+
+    /* A simple kernel shell */
+    const char prompt[] = "PKUOS> ";
+    input_init ();
+
+    printf ("\n");
+    while (true) {
+      printf ("%s", prompt);
+      char ch;
+      char input[KS_BUFFER_SIZE];
+      memset(input, 0, sizeof(input));
+      int cursor = 0, end = 0;
+
+      /* Read one key stroke */
+      while ((ch = (char) input_getc ()) != '\r' && ch != '\n') {
+
+        // Esc + keys
+        if (ch == 0x1b) {
+          // Arrows
+          if (input_getc() == 0x5b) {
+            switch (input_getc()) {
+              // UP: disabled
+              case 0x41: break;
+              // DOWN: disabled
+              case 0x42: break;
+              // RIGHT: move cursor
+              case 0x43: 
+                if (cursor < end) {
+                  printf ("%c%c%c", 0x1b, 0x5b, 0x43);
+                  cursor++;
+                }
+                break;
+              // LEFT: move cursor
+              case 0x44: 
+                if (cursor > 0) {
+                  printf ("%c%c%c", 0x1b, 0x5b, 0x44);
+                  cursor--;
+                }
+                break;
+              default: break;
+            }
+          }
+        }
+        // Baskspace
+        else if (ch == '\b' || ch == 0x7f) {
+          if (cursor > 0) {
+            putchar ('\b');
+            for (int i = --cursor; i < end; i++) {
+              input[i] = input[i+1];
+              printf ("%c", input[i]);
+            }
+            end--;
+            printf (" \b");
+            for (int i = cursor; i < end; i++) {
+              putchar ('\b');
+            }
+          }
+        }
+        
+        // Normal input
+        else if (end < KS_BUFFER_SIZE - 1) {
+          end++;
+          for (int i = cursor; i < end; i++) {
+            putchar (ch);
+            char tmp = input[i];
+            input[i] = ch;
+            ch = tmp;
+          }
+          cursor++;
+          for (int i = cursor; i < end; i++) {
+            putchar ('\b');
+          }
+        } 
+      }
+
+      input[end] = '\0';
+      printf ("\n");
+
+      /* Parses the input */
+      if (strcmp (input, "whoami") == 0) {
+        printf ("2000012959\n");
+      }
+      else if (strcmp (input, "exit") == 0) {
+        break;
+      }
+      else {
+        printf ("%s: invalid command\n", input);
+      }
+    }
   }
 
   /* Finish up. */
   shutdown ();
   thread_exit ();
 }
-
+
 /** Clear the "BSS", a segment that should be initialized to
    zeros.  It isn't actually stored on disk or zeroed by the
    kernel loader, so we have to zero it ourselves.
