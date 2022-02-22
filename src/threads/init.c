@@ -62,6 +62,7 @@ static void paging_init (void);
 
 static char **read_command_line (void);
 static char **parse_options (char **argv);
+static int ks_parseline (const char *cmdline, struct cmdline_tokens *tok);
 static void run_actions (char **argv);
 static void usage (void);
 
@@ -138,7 +139,6 @@ pintos_init (void)
 
     /* A simple kernel shell */
     const char prompt[] = "PKUOS> ";
-    input_init ();
 
     printf ("\n");
     while (true) {
@@ -214,15 +214,24 @@ pintos_init (void)
       printf ("\n");
 
       /* Parses the input */
-      if (strcmp (input, "whoami") == 0) {
-        printf ("2000012959\n");
-      }
-      else if (strcmp (input, "exit") == 0) {
+      struct cmdline_tokens tok;
+
+      int state = ks_parseline(input, &tok);
+      int exited = 0;
+
+      if (state == -1) /* parsing error */
         break;
+      if (tok.argv[0] == NULL) /* ignore empty lines */
+        continue;
+
+      switch(tok.builtins) {
+        case BUILTIN_EXIT: exited = 1; break;
+        case BUILTIN_WHOAMI: printf ("2000012959\n"); break;
+        case BUILTIN_NONE: printf ("%s: invalid command\n", input); break;
       }
-      else {
-        printf ("%s: invalid command\n", input);
-      }
+
+      if(exited)
+        break;
     }
   }
 
@@ -369,6 +378,78 @@ parse_options (char **argv)
   random_init (rtc_get_time ());
   
   return argv;
+}
+
+/** parseline - Parse the command line and build the argv array,
+    returns -1 if cmdline is incorrectly formatted */
+static int 
+ks_parseline(const char *cmdline, struct cmdline_tokens *tok) 
+{
+  static char array[KS_BUFFER_SIZE];   /* holds local copy of command line */
+  const char delims[10] = " \t\r\n";   /* argument delimiters (white-space) */
+  char *buf = array;                   /* ptr that traverses command line */
+  char *next;                          /* ptr to the end of the current arg */
+  char *endbuf;                        /* ptr to end of cmdline string */
+
+  if (cmdline == NULL) {
+    printf("Error: command line is NULL\n");
+    return -1;
+  }
+
+  strlcpy(buf, cmdline, KS_BUFFER_SIZE);
+  endbuf = buf + strlen(buf);
+
+  /* Build the argv list */
+  tok->argc = 0;
+
+  while (buf < endbuf) {
+    /* Skip the white-spaces */
+    buf += strspn (buf, delims);
+    if (buf >= endbuf) break;
+
+    if (*buf == '\'' || *buf == '\"') {
+      /* Detect quoted tokens */
+      buf++;
+      next = strchr (buf, *(buf-1));
+    } else {
+        /* Find next delimiter */
+        next = buf + strcspn (buf, delims);
+    }
+
+    if (next == NULL) {
+      /* Returned by strchr(); this means that the closing
+         quote was not found. */
+        printf ("Error: unmatched %c.\n", *(buf-1));
+        return -1;
+    }
+
+    /* Terminate the token */
+    *next = '\0';
+
+    /* Record the token as either the next argument */
+    tok->argv[tok->argc++] = buf;
+
+    /* Check if argv is full */
+    if (tok->argc >= KS_MAXARGS-1) break;
+
+    buf = next + 1;
+  }
+
+  /* The argument list must end with a NULL pointer */
+  tok->argv[tok->argc] = NULL;
+
+  if (tok->argc == 0)  /* ignore blank line */
+      return 1;
+
+  if (!strcmp(tok->argv[0], "exit")) {                 /* exit command */
+    tok->builtins = BUILTIN_EXIT;
+  } else if (!strcmp(tok->argv[0], "whoami")) {          /* whoami command */
+    tok->builtins = BUILTIN_WHOAMI;
+  } else {
+    tok->builtins = BUILTIN_NONE;
+  }
+  
+  return 1;
 }
 
 /** Runs the task specified in ARGV[1]. */

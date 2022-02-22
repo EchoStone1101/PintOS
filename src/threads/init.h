@@ -12,4 +12,16 @@ extern uint32_t *init_page_dir;
 /** Kernel shell line buffer size */
 #define KS_BUFFER_SIZE 64
 
+/** Kernel shell command max argument count */
+#define KS_MAXARGS 16
+
+struct cmdline_tokens {
+int argc;                 /* Number of arguments */
+  char *argv[KS_MAXARGS];    /* The arguments list */
+  enum builtins_t {       /* Indicates if argv[0] is a builtin command */
+    BUILTIN_NONE,
+    BUILTIN_EXIT,
+    BUILTIN_WHOAMI,} builtins;
+};
+
 #endif /**< threads/init.h */
