@@ -138,6 +138,7 @@ pintos_init (void)
     // TODO: no command line passed to kernel. Run interactively 
 
     /* A simple kernel shell */
+    
     const char prompt[] = "PKUOS> ";
 
     printf ("\n");
@@ -148,10 +149,10 @@ pintos_init (void)
       memset(input, 0, sizeof(input));
       int cursor = 0, end = 0;
 
-      /* Read one key stroke */
+      /* Read one key stroke until it's \n or \r */
       while ((ch = (char) input_getc ()) != '\r' && ch != '\n') {
 
-        // Esc + keys
+        // Esc special commands
         if (ch == 0x1b) {
           // Arrows
           if (input_getc() == 0x5b) {
@@ -193,9 +194,8 @@ pintos_init (void)
             }
           }
         }
-        
         // Normal input
-        else if (end < KS_BUFFER_SIZE - 1) {
+        else if (end < KS_BUFFER_SIZE - 1) { 
           end++;
           for (int i = cursor; i < end; i++) {
             putchar (ch);
@@ -209,7 +209,6 @@ pintos_init (void)
           }
         } 
       }
-
       input[end] = '\0';
       printf ("\n");
 
@@ -224,10 +223,11 @@ pintos_init (void)
       if (tok.argv[0] == NULL) /* ignore empty lines */
         continue;
 
+      /* Execute built-in commands */ 
       switch(tok.builtins) {
         case BUILTIN_EXIT: exited = 1; break;
         case BUILTIN_WHOAMI: printf ("2000012959\n"); break;
-        case BUILTIN_NONE: printf ("%s: invalid command\n", input); break;
+        case BUILTIN_NONE: printf ("%s: invalid command\n", tok.argv[0]); break;
       }
 
       if(exited)
