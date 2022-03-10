@@ -95,6 +95,11 @@ thread_init (void)
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
+  // This call is possible because running_thread() essentially
+  // round %esp to start of the page, where by Pintos convention
+  // the thread struct resides.
+
+
   init_thread (initial_thread, "main", PRI_DEFAULT);
   initial_thread->status = THREAD_RUNNING;
   initial_thread->tid = allocate_tid ();
@@ -410,6 +415,11 @@ idle (void *idle_started_ UNUSED)
 
          See [IA32-v2a] "HLT", [IA32-v2b] "STI", and [IA32-v3a]
          7.11.1 "HLT Instruction". */
+
+      // More explicitly put: "sti" enables interrupts, but after
+      // "hlt" (which makes CPU sleeps to save energy). After a
+      // tick the timer still interrupts, and the loop starts again
+      // to try letting other threads run.
       asm volatile ("sti; hlt" : : : "memory");
     }
 }
@@ -462,7 +472,9 @@ init_thread (struct thread *t, const char *name, int priority)
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
+  t->alarm = (int64_t) -1;
   t->magic = THREAD_MAGIC;
+  sema_init (&t->wakeup, 0);
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);

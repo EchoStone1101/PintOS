@@ -108,6 +108,7 @@ pintos_init (void)
 #endif
 
   /* Initialize interrupt handlers. */
+  // Including the timer interrupt handler
   intr_init ();
   timer_init ();
   kbd_init ();
@@ -149,13 +150,14 @@ pintos_init (void)
  *  Returns when user types "exit". */
 static void run_monitor (void) {
   const char prompt[] = "PKUOS> ";
+  char* input = (char*) malloc ((size_t)KS_BUFFER_SIZE);
 
   printf ("\n");
   while (true) {
     printf ("%s", prompt);
     char ch;
-    char input[KS_BUFFER_SIZE];
-    memset(input, 0, sizeof(input));
+
+    memset(input, 0, KS_BUFFER_SIZE * sizeof(char));
 
     /* Marker for advanced edit */
     int cursor = 0, end = 0;
@@ -239,7 +241,7 @@ static void run_monitor (void) {
 
     /* Execute built-in commands */ 
     switch(tok.builtins) {
-      case BUILTIN_EXIT: return;
+      case BUILTIN_EXIT: free(input); return;
       case BUILTIN_WHOAMI: printf ("2000012959\n"); break;
       case BUILTIN_NONE: printf ("%s: invalid command\n", tok.argv[0]); break;
     }

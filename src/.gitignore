@@ -5,3 +5,5 @@ tags
 *.a
 *.o
 .*.swp
+.DS_Store
+.vscode
