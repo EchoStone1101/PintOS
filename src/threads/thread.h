@@ -88,12 +88,20 @@ struct thread
     enum thread_status status;          /**< Thread state. */
     char name[16];                      /**< Name (for debugging purposes). */
     uint8_t *stack;                     /**< Saved stack pointer. */
-    int priority;                       /**< Priority. */
     struct list_elem allelem;           /**< List element for all threads list. */
 
-    struct list_elem sleepelem;         /**< Sorted list element for sleeping threads. */
+    /* For alarm clock */
     int64_t alarm;                      /**< Tick when thread should wake up. */
     struct semaphore wakeup;            /**< Semaphore for actual sleeping and wake-up */
+
+    /* For priority */
+    int base_priority;                  /**< Base priority. */
+    int priority;                       /**< Effective priority. */
+    struct list donators;               /**< List of locks which gives donation. */
+    struct lock *donatee_lock;     /**< The list_elem of the lock receiving donation. */
+
+    /* Meant to be reused like elem; currently only for alarm clock. */
+    struct list_elem blockelem;         /**< List element for blocked threads. */
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /**< List element. */
@@ -114,6 +122,7 @@ extern bool thread_mlfqs;
 
 void thread_init (void);
 void thread_start (void);
+void thread_schedule_init (void);
 
 void thread_tick (void);
 void thread_print_stats (void);
@@ -123,6 +132,7 @@ tid_t thread_create (const char *name, int priority, thread_func *, void *);
 
 void thread_block (void);
 void thread_unblock (struct thread *);
+void thread_schedule_reshuffle (struct thread *);
 
 struct thread *thread_current (void);
 tid_t thread_tid (void);
@@ -130,6 +140,17 @@ const char *thread_name (void);
 
 void thread_exit (void) NO_RETURN;
 void thread_yield (void);
+void potential_thread_yield (void);
+
+/**< list_less_func for sorting by priority */
+bool priority_greater_func (const struct list_elem *,
+                            const struct list_elem *,
+                            void *);
+
+/**< list_less_func for comparing priorities */
+bool priority_less_func (const struct list_elem *,
+                         const struct list_elem *,
+                         void *);
 
 /** Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func (struct thread *t, void *aux);

@@ -25,9 +25,6 @@ static int64_t ticks;
    ticks. */
 static struct list sleep_list;
 
-/** Lock for operating on sleep_list. */
-static struct lock sleep_list_lock;
-
 static bool sleep_less_func (const struct list_elem *a,
                              const struct list_elem *b,
                              void *aux);
@@ -54,7 +51,6 @@ timer_init (void)
 
   /* Initialize sleep_list */
   list_init(&sleep_list);
-  lock_init(&sleep_list_lock);
 }
 
 /** Calibrates loops_per_tick, used to implement brief delays. */
@@ -116,13 +112,14 @@ timer_sleep (int64_t ticks)
   int64_t alarm =  timer_ticks () + ticks;
 
   /* Add current thread to sleep_list */
-  lock_acquire (&sleep_list_lock);
+
+  intr_disable ();
 
   struct thread *cur = thread_current ();
   cur->alarm = alarm;
-  list_insert_ordered (&sleep_list, &cur->sleepelem, sleep_less_func, NULL);
+  list_insert_ordered (&sleep_list, &cur->blockelem, sleep_less_func, NULL);
 
-  lock_release (&sleep_list_lock);
+  intr_enable ();
 
   /* Now block until waken up by timer_interrupt() */
   sema_down (&cur->wakeup);
@@ -283,48 +280,24 @@ static bool
 sleep_less_func (const struct list_elem *a, const struct list_elem *b,
                  void *aux UNUSED)
 {
-  return list_entry (a, struct thread, sleepelem)->alarm < 
-         list_entry (b, struct thread, sleepelem)->alarm; 
+  return list_entry (a, struct thread, blockelem)->alarm < 
+         list_entry (b, struct thread, blockelem)->alarm; 
 }
 
 /** Check sleep_list and wake up threads if necessary */
 static void
 timer_wakeup (void)
-{
-  /* Timer interrupt might happen before timer_sleep() finishes
-     operating on sleep_list. If so, lock_try_acquire() fails,
-     and we skip wake-up for this tick.
-
-     lock_held_by_current_thread() is added here to avoid panic
-     when the interrupted thread is halfway through timer_sleep(), 
-     which means we are trying to acquire a lock held already.
-      
-     Normally this indicates that we should switch to a semaphore, 
-     but there's one more concern: suppose a low priority thread is
-     interrupted halfway through timer_sleep(), and a higher priority
-     thread preempts. Now all sleeping threads will not be waken,
-     waiting for the not-scheduled lower priority thread to up the
-     "sleep_list_lock" semaphore. This exact problem is solved by
-     adding priority donation to locks (which is why we stick with
-     lock here), while semaphores don't work with donation, as they
-     can be up-ed by any thread.
-     */
-    
-  if (!lock_held_by_current_thread(&sleep_list_lock) && 
-       lock_try_acquire (&sleep_list_lock))
+{   
+  while (!list_empty(&sleep_list))
     {
-      while (!list_empty(&sleep_list))
+      struct thread *t = list_entry (list_front (&sleep_list), 
+                                     struct thread, blockelem);
+      if (t->alarm <= timer_ticks ())
         {
-          struct thread *t = list_entry (list_front (&sleep_list), 
-                                         struct thread, sleepelem);
-          if (t->alarm <= timer_ticks ())
-            {
-              list_pop_front (&sleep_list);
-              sema_up (&t->wakeup);
-            }
-          else
-            break;
+          list_pop_front (&sleep_list);
+          sema_up (&t->wakeup);
         }
-      lock_release (&sleep_list_lock);
+      else
+        break;
     }
 }
