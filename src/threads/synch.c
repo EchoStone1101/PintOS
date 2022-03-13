@@ -322,7 +322,7 @@ lock_give_donation (struct lock * lock)
                                      struct lock, lockelem)->donated_priority;
       if (new_priority > donatee->priority)
         {
-          donatee->priority = lock->donated_priority;
+          donatee->priority = new_priority;
           /* Relocate donatee if it is READY */
           if (donatee->status == THREAD_READY)
             {

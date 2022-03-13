@@ -27,6 +27,16 @@
    that are ready to run but not actually running. */
 static struct list ready_list;
 
+/** Multilevel feed-back queues when thread_mlfqs is set. */
+static struct list mlf_queues[PRI_MAX+1];
+
+/** Bitmaps for quick navigation of mlf_queues. */
+static uint32_t mlf_bitmap_upper;
+static uint32_t mlf_bitmap_lower;
+
+/** System load_avg for MLFQ scheduler */
+static fp_real load_avg;
+
 /** List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
@@ -115,6 +125,13 @@ thread_schedule_init (void)
   if (thread_mlfqs)
     {
       /* Initialize multi-queues */
+      for (int i = PRI_MIN;i <= PRI_MAX;i++)
+        list_init (&mlf_queues[i]);
+      
+      mlf_bitmap_upper = (uint32_t) 0;
+      mlf_bitmap_lower = (uint32_t) 0;
+
+      load_avg = fp_to_real(0);
     }
   else
     {
@@ -156,13 +173,14 @@ thread_tick (void)
 #endif
   else
     kernel_ticks++;
+  
+  /* Update recent_cpu for the running thread */
+  if (thread_mlfqs && t != idle_thread)
+    t->recent_cpu_time = fp_add_int (t->recent_cpu_time, 1);
 
   /* Enforce preemption: expired time slice */
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
-  
-  /* Enforce preemption: priority check */
-  potential_thread_yield ();
 }
 
 /** Prints thread statistics. */
@@ -171,68 +189,6 @@ thread_print_stats (void)
 {
   printf ("Thread: %lld idle ticks, %lld kernel ticks, %lld user ticks\n",
           idle_ticks, kernel_ticks, user_ticks);
-}
-
-/** Wrapper routine for checking whether to yield in 
-    priority scheduling */
-void
-potential_thread_yield (void)
-{
-#ifndef TEST_THREAD_YIELD_RACE
-
-  /* Standard implementation */
-
-  enum intr_level old_level;
-  if (intr_context ())
-    old_level = intr_disable ();
-  
-  /* If not the top priority, yield */
-  if (!thread_mlfqs)
-    {
-      /* Priority scheduling */
-      struct thread *next = next_thread_to_run (false);
-
-      /* Corner case: before idle_thread is initialized, 
-         early sema_up() calls will invoke this function,
-         when next_thread_to_run() returns NULL. */
-      if (next == NULL)
-        {
-          ASSERT (idle_thread == NULL);
-          return;
-        }
-      if (next->priority > thread_get_priority ())
-        intr_context () ? intr_yield_on_return () : (intr_set_level (old_level), thread_yield ());
-    }
-  else
-    {
-      /* Multi-level feedback queue */
-    }
-
-#else
-
-  /* Testing only */
-  /* There is a synchronization problem in the implementation above:
-     between the if-statement and thread_yield() actually making switch,
-     suppose timer interrupt happens, schedules the new thread, and
-     it even finishes? Then we will yield again, when there is no longer
-     reason for doing so.
-     One thing is: it does not matter much. Atomic or not, current thread
-     will be yielded, and goes somewhere in ready_list. If it is close to
-     the front, yielding once more isn't that much delay; or if it is deep
-     into the list, then that's a far future thing anyway, which we cannot
-     really plan well. 
-     Nevertheless, an atomic version is possible, and we put it here just
-     for later testing.
-     */
-  enum intr_level old_level = intr_disable ();
-  if (!list_empty(&ready_list))
-    {
-      struct thread *t = list_entry (list_front (&ready_list), struct thread, elem);
-      if (t->priority > thread_current ()->priority)
-        __thread_yield (old_level);
-    }
-
-#endif
 }
 
 /** Creates a new kernel thread named NAME with the given initial
@@ -265,6 +221,11 @@ thread_create (const char *name, int priority,
 
   /* Initialize thread. */
   init_thread (t, name, priority);
+
+  /* Nice and recent_cpu is inherited. */
+  t->nice = thread_get_nice ();
+  t->recent_cpu_time = thread_current ()->recent_cpu_time;
+
   tid = t->tid = allocate_tid ();
 
   /* Stack frame for kernel_thread(). */
@@ -304,7 +265,23 @@ thread_block (void)
   ASSERT (!intr_context ());
   ASSERT (intr_get_level () == INTR_OFF);
 
-  thread_current ()->status = THREAD_BLOCKED;
+  struct thread *t = thread_current ();
+
+  /* Thread becomes blocked not because of priority change.
+     In other words, the priority stays the same till now. */
+  if (thread_mlfqs)
+    {
+      int level = thread_get_priority ();
+      if (list_empty (&mlf_queues[level]))
+        {
+          if (level <= 31)
+            mlf_bitmap_lower &= ~(1<<level);
+          else
+            mlf_bitmap_upper &= ~(1<<(level-32));
+        }
+    }
+
+  t->status = THREAD_BLOCKED;
   schedule ();
 }
 
@@ -357,7 +334,7 @@ thread_current (void)
      recursion can cause stack overflow. */
   ASSERT (is_thread (t));
   ASSERT (t->status == THREAD_RUNNING);
-  ASSERT (t->priority >= t->base_priority);
+  ASSERT (thread_mlfqs || t->priority >= t->base_priority);
 
   return t;
 }
@@ -410,6 +387,63 @@ thread_yield (void)
   intr_set_level (old_level);
 }
 
+/** Wrapper routine for checking whether to yield. */
+void
+potential_thread_yield (void)
+{
+#ifndef TEST_THREAD_YIELD_RACE
+
+  /* Standard implementation */
+
+  enum intr_level old_level;
+  if (!intr_context())
+    old_level = intr_disable ();
+
+  struct thread *next = next_thread_to_run (false);
+
+  /* Corner case: before idle_thread is initialized, 
+     early sema_up() calls will invoke this function,
+     when next_thread_to_run() returns NULL. */
+  if (next == NULL)
+    {
+      ASSERT (idle_thread == NULL);
+      return;
+    }
+  
+  if (!intr_context())
+    intr_set_level (old_level);
+  
+  /* If not the top priority, yield */
+  if (next->priority > thread_get_priority ())
+    intr_context () ? intr_yield_on_return () : thread_yield ();
+
+#else
+
+  /* Testing only */
+  /* There is a synchronization problem in the implementation above:
+     between the if-statement and thread_yield() actually making switch,
+     suppose timer interrupt happens, schedules the new thread, and
+     it even finishes? Then we will yield again, when there is no longer
+     reason for doing so.
+     One thing is: it does not matter much. Atomic or not, current thread
+     will be yielded, and goes somewhere in ready_list. If it is close to
+     the front, yielding once more isn't that much delay; or if it is deep
+     into the list, then that's a far future thing anyway, which we cannot
+     really plan well. 
+     Nevertheless, an atomic version is possible, and we put it here just
+     for later testing.
+     */
+  enum intr_level old_level = intr_disable ();
+  if (!list_empty(&ready_list))
+    {
+      struct thread *t = list_entry (list_front (&ready_list), struct thread, elem);
+      if (t->priority > thread_current ()->priority)
+        __thread_yield (old_level);
+    }
+
+#endif
+}
+
 /** Internal atomic function for testing a specific 
     racing problem. Irrelavant in standard implementation. */
 static void __thread_yield (enum intr_level old_level)
@@ -442,6 +476,12 @@ thread_schedule_reshuffle (struct thread *t)
   else
     {
       /* Multi-level feedback queue */
+      int level = t->priority;
+      list_push_back (&mlf_queues[level], &t->elem);
+      if (level <= 31)
+        mlf_bitmap_lower |= (1<<level);
+      else
+        mlf_bitmap_upper |= (1<<(level-32));
     }
 }
 
@@ -488,37 +528,129 @@ thread_get_priority (void)
   return thread_current ()->priority;
 }
 
+/** Recalculates the priority of T according to MLFQ scheduling
+    policy, namely
 
+          priority = PRI_MAX - 1/4 * recent_cpu - 2 * nice 
+    
+    rounded to the nearest integer. This function is formatted so
+    that it can be passed to thread_foreach() as an action. */
+void
+thread_recalc_priority (struct thread *t, void *aux UNUSED)
+{
+  if (!thread_mlfqs || t == idle_thread)
+    return;
+  
+  fp_real tmp1 = fp_to_real (PRI_MAX);
+  fp_real tmp2 = fp_add (fp_div_int (t->recent_cpu_time, 4),
+                         fp_mult_int (fp_to_real (t->nice), 2));
+  
+  int new_priority = fp_to_int_nearest (fp_sub (tmp1, tmp2));
+
+  /* Clamp priority between PRI_MIN and PRI_MAX*/
+  if (new_priority < PRI_MIN)
+    new_priority = PRI_MIN;
+  else if (new_priority > PRI_MAX)
+    new_priority = PRI_MAX;
+
+  int old_priority = t->priority;
+
+  /* Priority unchanged, no more to do. */
+  if (old_priority == new_priority)
+    return;
+
+  t->priority = new_priority; 
+
+  switch (t->status)
+    {
+      case THREAD_RUNNING: 
+          potential_thread_yield (); 
+          break;      
+      case THREAD_READY: 
+          /* Only possible when called by timer interrupt handler */
+          list_remove (&t->elem);
+          if (list_empty (&mlf_queues[old_priority]))
+            {
+              if (old_priority <= 31)
+                mlf_bitmap_lower &= ~(1<<old_priority);
+              else
+                mlf_bitmap_upper &= ~(1<<(old_priority-32));
+            }
+          thread_schedule_reshuffle (t);
+          break;
+      default: 
+          /* No more to do for BLOCKED/DYING threads */
+          break;
+    }
+}
 
 /** Sets the current thread's nice value to NICE. */
 void
-thread_set_nice (int nice UNUSED) 
+thread_set_nice (int nice) 
 {
-  /* Not yet implemented. */
+  /* Clamp NICE between -20 and 20 */
+  if (nice < -20)
+    nice = -20;
+  else if (nice > 20)
+    nice = 20;
+
+  struct thread *cur = thread_current ();
+  cur->nice = nice;
+
+  /* Recalculates priority. */
+  thread_recalc_priority (cur, NULL);
 }
 
 /** Returns the current thread's nice value. */
 int
 thread_get_nice (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  return thread_current ()->nice;
 }
 
 /** Returns 100 times the system load average. */
 int
 thread_get_load_avg (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  return fp_to_int_nearest (fp_mult_int (load_avg, 100));
 }
+
+/** Updates system load_avg every SEC. */
+void 
+thread_update_load_avg (void)
+{
+  /* Not to forget the running thread, which is not in
+     mlf_queues. */
+  int ready_threads = (thread_current () != idle_thread);
+
+  for (int level = PRI_MIN; level <= PRI_MAX; level++)
+    ready_threads += list_size (&mlf_queues[level]);
+  
+  fp_real tmp1 = fp_div_int (fp_mult_int (load_avg, 59), 60);
+  fp_real tmp2 = fp_div_int (fp_to_real (ready_threads), 60);
+
+  load_avg = fp_add (tmp1, tmp2);
+}
+
 
 /** Returns 100 times the current thread's recent_cpu value. */
 int
 thread_get_recent_cpu (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  return fp_to_int_nearest (fp_mult_int (thread_current ()->recent_cpu_time, 100));
+}
+
+/** Updates each threads' recent_cpu evert SEC */
+void thread_action_update_cpu (struct thread *t, void *aux UNUSED)
+{
+  if (!thread_mlfqs || t == idle_thread)
+    return;
+
+  fp_real tmp = fp_mult_int (load_avg, 2);
+  fp_real coef = fp_div (tmp, (fp_add_int (tmp, 1)));
+
+  t->recent_cpu_time = fp_add (fp_mult (t->recent_cpu_time, coef),
+                               fp_to_real (t->nice));
 }
 
 /** Idle thread.  Executes when no other thread is ready to run.
@@ -615,10 +747,24 @@ init_thread (struct thread *t, const char *name, int priority)
   t->alarm = (int64_t) -1;
   sema_init (&t->wakeup, 0);
 
-  t->base_priority = priority;
-  t->priority = priority;
   t->donatee_lock = NULL;
   list_init (&t->donators);
+  t->nice = 0;
+  t->recent_cpu_time = fp_to_int_zero (0);
+  if (!thread_mlfqs)
+    {
+      /* Priority scheduling */
+      t->base_priority = priority;
+      t->priority = priority;
+    }
+  else
+    {
+      /* Multilevel feeback queue */
+      t->base_priority = PRI_MIN;
+      t->priority = PRI_MIN;
+
+      thread_recalc_priority (t, NULL);
+    }
 
   t->magic = THREAD_MAGIC;
 
@@ -661,7 +807,36 @@ next_thread_to_run (bool pop)
     }
   else
     {
-      return idle_thread;
+      /* Multilevel feedback queue */
+
+      /* No ready threads, schedule idle_thread. */
+      if (mlf_bitmap_upper == 0 && mlf_bitmap_lower == 0)
+        return idle_thread;
+
+      /* Else, must have ready thread(s). Find the highest bit set. */
+      unsigned int r, shift;
+      unsigned int v = mlf_bitmap_upper ? mlf_bitmap_upper : mlf_bitmap_lower;
+      unsigned int bias = mlf_bitmap_upper ? 32 : 0;
+
+      r     = (v > 0xFFFF) << 4; v >>= r;
+      shift = (v > 0xFF  ) << 3; v >>= shift; r |= shift;
+      shift = (v > 0xF   ) << 2; v >>= shift; r |= shift;
+      shift = (v > 0x3   ) << 1; v >>= shift; r |= shift;
+                                              r |= (v >> 1);
+      
+      int level = bias + r;
+
+      struct list_elem *e = pop ? list_pop_front (&mlf_queues[level]) : 
+                                  list_front (&mlf_queues[level]);
+      if (pop && list_empty (&mlf_queues[level]))
+        {
+          if (level <= 31)
+            mlf_bitmap_lower &= ~(1<<r);
+          else
+            mlf_bitmap_upper &= ~(1<<r);
+        }
+      
+      return list_entry (e, struct thread, elem);
     }
 }
     

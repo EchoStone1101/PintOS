@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include <fixedpoint.h>
 #include "threads/synch.h"
 
 /** States in a thread's life cycle. */
@@ -24,6 +25,9 @@ typedef int tid_t;
 #define PRI_MIN 0                       /**< Lowest priority. */
 #define PRI_DEFAULT 31                  /**< Default priority. */
 #define PRI_MAX 63                      /**< Highest priority. */
+
+/** MLFQ scheduler frequency for recalculating priorities */
+#define MLFQ_FREQ 4                     
 
 /** A kernel thread or user process.
 
@@ -98,7 +102,9 @@ struct thread
     int base_priority;                  /**< Base priority. */
     int priority;                       /**< Effective priority. */
     struct list donators;               /**< List of locks which gives donation. */
-    struct lock *donatee_lock;     /**< The list_elem of the lock receiving donation. */
+    struct lock *donatee_lock;          /**< The list_elem of the lock receiving donation. */
+    int nice;                           /**< The nice value for MLFQS */
+    fp_real recent_cpu_time;            /**< The rolling average recent cpu time for MLFQS */
 
     /* Meant to be reused like elem; currently only for alarm clock. */
     struct list_elem blockelem;         /**< List element for blocked threads. */
@@ -159,9 +165,14 @@ void thread_foreach (thread_action_func *, void *);
 int thread_get_priority (void);
 void thread_set_priority (int);
 
+
 int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
+
+void thread_recalc_priority (struct thread *, void *);
+void thread_action_update_cpu (struct thread *, void *);
+void thread_update_load_avg (void);
 
 #endif /**< threads/thread.h */

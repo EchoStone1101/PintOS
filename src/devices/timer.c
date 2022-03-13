@@ -194,13 +194,35 @@ timer_print_stats (void)
 {
   printf ("Timer: %"PRId64" ticks\n", timer_ticks ());
 }
-
+
 /** Timer interrupt handler. */
 static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
+
+  /* Where the running thread's recent_cpu updates */
   thread_tick ();
+
+  if (thread_mlfqs)
+    {
+      /* Updates overall load_avg and recent_cpu every SEC */
+      if (ticks % TIMER_FREQ == 0)
+        {
+          thread_foreach (thread_action_update_cpu, NULL);
+          thread_update_load_avg ();
+        }
+  
+      /* Updates all priorities every FOURTH tick */
+      if (ticks % MLFQ_FREQ == 0)
+        thread_foreach (thread_recalc_priority, NULL); 
+    }
+  
+  /* Current thread might yield, either because in priority scheduling
+     or MLFQ scheduling. */          
+  potential_thread_yield ();
+
+  /* Now wake up threads with updated stats */
   timer_wakeup ();
 }
 
