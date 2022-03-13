@@ -49,7 +49,7 @@ timer_init (void)
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
 
-  /* Initialize sleep_list */
+  /* Initialize sleep_list, for timer_sleep() calls. */
   list_init(&sleep_list);
 }
 
@@ -108,13 +108,18 @@ timer_sleep (int64_t ticks)
   /* Optimization for non-positive sleep time */
   if (ticks <= 0)
     return;
+
+  /* We choose to disable interrupts other than using, say, a semaphore, 
+     to protect accessing sleep_list, because interrupt handlers also
+     access sleep_list, and they cannot block on waiting a semaphore.
+     Even if we use try_down(), there's the possibility where low priority
+     thread holding the semaphore/lock gets scheduled away, and then no
+     other thread could access sleep_list. */
+  intr_disable ();
   
   int64_t alarm =  timer_ticks () + ticks;
 
   /* Add current thread to sleep_list */
-
-  intr_disable ();
-
   struct thread *cur = thread_current ();
   cur->alarm = alarm;
   list_insert_ordered (&sleep_list, &cur->blockelem, sleep_less_func, NULL);
@@ -200,7 +205,7 @@ static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
-
+  
   /* Where the running thread's recent_cpu updates */
   thread_tick ();
 
@@ -218,11 +223,11 @@ timer_interrupt (struct intr_frame *args UNUSED)
         thread_foreach (thread_recalc_priority, NULL); 
     }
   
-  /* Current thread might yield, either because in priority scheduling
+  /* Current thread might yield, either in priority scheduling
      or MLFQ scheduling. */          
   potential_thread_yield ();
 
-  /* Now wake up threads with updated stats */
+  /* Now wake up threads with updated priorities. */
   timer_wakeup ();
 }
 
@@ -306,7 +311,7 @@ sleep_less_func (const struct list_elem *a, const struct list_elem *b,
          list_entry (b, struct thread, blockelem)->alarm; 
 }
 
-/** Check sleep_list and wake up threads if necessary */
+/** Check sleep_list and wake up threads if on time */
 static void
 timer_wakeup (void)
 {   

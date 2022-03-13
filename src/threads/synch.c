@@ -115,6 +115,10 @@ sema_up (struct semaphore *sema)
   old_level = intr_disable ();
   if (!list_empty (&sema->waiters))
     {
+      /* Up-ing the thread with the highest priority is done by obtaining
+         the MAX element in UNSORTED waiter list. This is because waiters
+         can change their priority in multiple ways, where maintaining the
+         waiter list sorted becomes error prone. */
       struct list_elem *max = list_max (&sema->waiters, priority_less_func, NULL);
       list_remove (max);
       thread_unblock (list_entry (max, struct thread, elem));
@@ -122,6 +126,7 @@ sema_up (struct semaphore *sema)
     
   sema->value++;
   potential_thread_yield ();
+
   intr_set_level (old_level);
 }
 
@@ -221,7 +226,10 @@ lock_acquire (struct lock *lock)
 
   /* Lock acquired */
   lock->holder = thread_current ();
-  lock->holder->donatee_lock = NULL;
+  
+  /* The holder is now not donating to any lock. */
+  if (!thread_mlfqs)
+    lock->holder->donatee_lock = NULL;
 }
 
 /** Tries to acquires LOCK and returns true if successful or false
@@ -229,7 +237,8 @@ lock_acquire (struct lock *lock)
    thread.
 
    This function will not sleep, so it may be called within an
-   interrupt handler. */
+   interrupt handler. It also does NOT donate, since it does not
+   block anyway. */
 bool
 lock_try_acquire (struct lock *lock)
 {
@@ -258,7 +267,7 @@ lock_release (struct lock *lock)
 
   lock->holder = NULL;
 
-  if (!thread_mlfqs && lock->donated_priority > PRI_MIN)
+  if (!thread_mlfqs)
     lock_cancel_donation (lock);
 
   /* sema_up() invokes potential_thread_yield(); at the case of
@@ -287,6 +296,11 @@ static bool lock_greater_func (const struct list_elem *a,
   return left->donated_priority > right->donated_priority;
 }
 
+/** Wrapper rountine for giving donation. Only called when
+    thread_mlfqs is false.
+    Since we are not calling this function recursively to deal 
+    with nested donations, we support nested donation with 
+    arbitrary depth. */
 static void
 lock_give_donation (struct lock * lock)
 {
@@ -323,13 +337,13 @@ lock_give_donation (struct lock * lock)
       if (new_priority > donatee->priority)
         {
           donatee->priority = new_priority;
-          /* Relocate donatee if it is READY */
+          /* Reshuffle donatee if it is READY */
           if (donatee->status == THREAD_READY)
             {
               list_remove (&donatee->elem);
               thread_schedule_reshuffle (donatee);
             }
-          /* Else, donatee is reshuffled later when ready */
+          /* Else, donatee gets reshuffled later when ready */
         }
       
       /* Nested donation: pass it on */
@@ -340,10 +354,22 @@ lock_give_donation (struct lock * lock)
   intr_set_level (old_level);
 }
 
+/** Wrapper rountine for cancelling donation. Only called when
+    thread_mlfqs is false.
+    Since we are not calling this function recursively to deal 
+    with nested donations, we support nested donation with 
+    arbitrary depth. */
 static void
 lock_cancel_donation (struct lock * lock)
 {
   enum intr_level old_level = intr_disable ();
+
+  /* No donation is done. */
+  if (lock->donated_priority == PRI_MIN)
+    {
+      intr_set_level (old_level);
+      return;
+    }
 
   /* Detach from current thread's donators */
   list_remove (&lock->lockelem);
@@ -356,6 +382,9 @@ lock_cancel_donation (struct lock * lock)
   struct thread *cur = thread_current ();
   int donated_priority; 
 
+  /* Donatee could set its priority to be higher than the donated
+     priority afterwards, so we don't simply fall back to the new
+     top donator's priority. */
   if (list_empty (&cur->donators) || 
       (donated_priority = list_entry (list_front (&cur->donators), 
                           struct lock, lockelem)->donated_priority)

@@ -99,17 +99,19 @@ struct thread
     struct semaphore wakeup;            /**< Semaphore for actual sleeping and wake-up */
 
     /* For priority */
-    int base_priority;                  /**< Base priority. */
     int priority;                       /**< Effective priority. */
+    
+    int base_priority;                  /**< Base priority for donation. */
     struct list donators;               /**< List of locks which gives donation. */
     struct lock *donatee_lock;          /**< The list_elem of the lock receiving donation. */
+    
     int nice;                           /**< The nice value for MLFQS */
     fp_real recent_cpu_time;            /**< The rolling average recent cpu time for MLFQS */
 
     /* Meant to be reused like elem; currently only for alarm clock. */
     struct list_elem blockelem;         /**< List element for blocked threads. */
 
-    /* Shared between thread.c and synch.c. */
+    /* Shared between ready list(s) and semaphores. */
     struct list_elem elem;              /**< List element. */
 
 #ifdef USERPROG
@@ -148,12 +150,10 @@ void thread_exit (void) NO_RETURN;
 void thread_yield (void);
 void potential_thread_yield (void);
 
-/**< list_less_func for sorting by priority */
 bool priority_greater_func (const struct list_elem *,
                             const struct list_elem *,
                             void *);
 
-/**< list_less_func for comparing priorities */
 bool priority_less_func (const struct list_elem *,
                          const struct list_elem *,
                          void *);
@@ -164,7 +164,6 @@ void thread_foreach (thread_action_func *, void *);
 
 int thread_get_priority (void);
 void thread_set_priority (int);
-
 
 int thread_get_nice (void);
 void thread_set_nice (int);

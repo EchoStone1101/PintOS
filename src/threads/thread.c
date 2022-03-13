@@ -20,9 +20,6 @@
    of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
 
-/** Whether to test a specific racing problem regarding thread_yield() */
-// #define TEST_THREAD_YIELD_RACE
-
 /** List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
 static struct list ready_list;
@@ -30,9 +27,11 @@ static struct list ready_list;
 /** Multilevel feed-back queues when thread_mlfqs is set. */
 static struct list mlf_queues[PRI_MAX+1];
 
-/** Bitmaps for quick navigation of mlf_queues. */
-static uint32_t mlf_bitmap_upper;
-static uint32_t mlf_bitmap_lower;
+/** Bitmap for quick navigation of mlf_queues. */
+static uint64_t mlf_bitmap;
+
+/** Macro for operating on mlf_bitmap */
+#define MLFQS_MASK(N) (1ull << N)
 
 /** System load_avg for MLFQ scheduler */
 static fp_real load_avg;
@@ -84,7 +83,6 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
-static void __thread_yield (enum intr_level old_level) UNUSED;
 
 /** Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
@@ -128,16 +126,12 @@ thread_schedule_init (void)
       for (int i = PRI_MIN;i <= PRI_MAX;i++)
         list_init (&mlf_queues[i]);
       
-      mlf_bitmap_upper = (uint32_t) 0;
-      mlf_bitmap_lower = (uint32_t) 0;
-
+      mlf_bitmap = (uint64_t) 0;
       load_avg = fp_to_real(0);
     }
   else
-    {
-      /* Initialize ready_list */
-      list_init (&ready_list);
-    }
+    /* Initialize ready_list */
+    list_init (&ready_list);
 }
 
 /** Starts preemptive thread scheduling by enabling interrupts.
@@ -268,19 +262,14 @@ thread_block (void)
   struct thread *t = thread_current ();
 
   /* Thread becomes blocked not because of priority change.
-     In other words, the priority stays the same till now. */
+     In other words, the priority stays the same till now, which
+     we use to update the mlf_bitmap if needed */
   if (thread_mlfqs)
     {
       int level = thread_get_priority ();
       if (list_empty (&mlf_queues[level]))
-        {
-          if (level <= 31)
-            mlf_bitmap_lower &= ~(1<<level);
-          else
-            mlf_bitmap_upper &= ~(1<<(level-32));
-        }
+        mlf_bitmap &= ~MLFQS_MASK (level);
     }
-
   t->status = THREAD_BLOCKED;
   schedule ();
 }
@@ -306,8 +295,6 @@ thread_unblock (struct thread *t)
   t->status = THREAD_READY;
 
   thread_schedule_reshuffle (t);
-
-  /* According to the header comment, this function does not preempt. */
   
   intr_set_level (old_level);
 }
@@ -334,6 +321,9 @@ thread_current (void)
      recursion can cause stack overflow. */
   ASSERT (is_thread (t));
   ASSERT (t->status == THREAD_RUNNING);
+
+  /* Sanity check for priority scheduling: effective priority must
+     not be lower than base priority. */
   ASSERT (thread_mlfqs || t->priority >= t->base_priority);
 
   return t;
@@ -387,14 +377,17 @@ thread_yield (void)
   intr_set_level (old_level);
 }
 
-/** Wrapper routine for checking whether to yield. */
+
+/** Wrapper routine for checking whether to yield. 
+ 
+    This function can be called either by a normal thread or
+    by an interrupt handler, providing a consistent interface. 
+
+    Behavior is controlled by intr_context(). When in interrupt
+    context, yield on return; else, yield right away. */
 void
 potential_thread_yield (void)
 {
-#ifndef TEST_THREAD_YIELD_RACE
-
-  /* Standard implementation */
-
   enum intr_level old_level;
   if (!intr_context())
     old_level = intr_disable ();
@@ -416,47 +409,6 @@ potential_thread_yield (void)
   /* If not the top priority, yield */
   if (next->priority > thread_get_priority ())
     intr_context () ? intr_yield_on_return () : thread_yield ();
-
-#else
-
-  /* Testing only */
-  /* There is a synchronization problem in the implementation above:
-     between the if-statement and thread_yield() actually making switch,
-     suppose timer interrupt happens, schedules the new thread, and
-     it even finishes? Then we will yield again, when there is no longer
-     reason for doing so.
-     One thing is: it does not matter much. Atomic or not, current thread
-     will be yielded, and goes somewhere in ready_list. If it is close to
-     the front, yielding once more isn't that much delay; or if it is deep
-     into the list, then that's a far future thing anyway, which we cannot
-     really plan well. 
-     Nevertheless, an atomic version is possible, and we put it here just
-     for later testing.
-     */
-  enum intr_level old_level = intr_disable ();
-  if (!list_empty(&ready_list))
-    {
-      struct thread *t = list_entry (list_front (&ready_list), struct thread, elem);
-      if (t->priority > thread_current ()->priority)
-        __thread_yield (old_level);
-    }
-
-#endif
-}
-
-/** Internal atomic function for testing a specific 
-    racing problem. Irrelavant in standard implementation. */
-static void __thread_yield (enum intr_level old_level)
-{
-  struct thread *cur = thread_current ();
-  
-  ASSERT (!intr_context ());
-  cur->status = THREAD_READY;
-
-  if (cur != idle_thread) 
-    thread_schedule_reshuffle (cur);
-  schedule ();
-  intr_set_level (old_level);
 }
 
 /** Reshuffle current thread into ready list(s) 
@@ -478,10 +430,7 @@ thread_schedule_reshuffle (struct thread *t)
       /* Multi-level feedback queue */
       int level = t->priority;
       list_push_back (&mlf_queues[level], &t->elem);
-      if (level <= 31)
-        mlf_bitmap_lower |= (1<<level);
-      else
-        mlf_bitmap_upper |= (1<<(level-32));
+      mlf_bitmap |= MLFQS_MASK (level);
     }
 }
 
@@ -513,10 +462,11 @@ thread_set_priority (int new_priority)
   struct thread *cur = thread_current ();
 
   cur->base_priority = new_priority;
-
   /* Either no donators, or new priority overrides. */
+  enum intr_level old_level = intr_disable ();
   if (list_empty (&cur->donators) || cur->priority < new_priority)
     cur->priority = new_priority;
+  intr_set_level (old_level);
 
   potential_thread_yield ();
 }
@@ -559,6 +509,7 @@ thread_recalc_priority (struct thread *t, void *aux UNUSED)
   if (old_priority == new_priority)
     return;
 
+  /* Else, might need to operate the ready list or yield */
   t->priority = new_priority; 
 
   switch (t->status)
@@ -570,12 +521,7 @@ thread_recalc_priority (struct thread *t, void *aux UNUSED)
           /* Only possible when called by timer interrupt handler */
           list_remove (&t->elem);
           if (list_empty (&mlf_queues[old_priority]))
-            {
-              if (old_priority <= 31)
-                mlf_bitmap_lower &= ~(1<<old_priority);
-              else
-                mlf_bitmap_upper &= ~(1<<(old_priority-32));
-            }
+            mlf_bitmap &= ~MLFQS_MASK (old_priority);
           thread_schedule_reshuffle (t);
           break;
       default: 
@@ -615,7 +561,12 @@ thread_get_load_avg (void)
   return fp_to_int_nearest (fp_mult_int (load_avg, 100));
 }
 
-/** Updates system load_avg every SEC. */
+/** Updates system load_avg every SEC, according to the formula:
+      
+      load_avg  =  (59/60) * load_avg + (1/60) * ready_threads
+    
+    where ready_threads is the number of threads in the ready list,
+    plus the running thread (if not idle_thread). */
 void 
 thread_update_load_avg (void)
 {
@@ -623,6 +574,9 @@ thread_update_load_avg (void)
      mlf_queues. */
   int ready_threads = (thread_current () != idle_thread);
 
+  /* Since this update happens once a second, it is acceptable to 
+     count threads using the O(n) list_size() API. Maintaining a
+     *synchronized* thread number on the fly can be error prone. */
   for (int level = PRI_MIN; level <= PRI_MAX; level++)
     ready_threads += list_size (&mlf_queues[level]);
   
@@ -640,7 +594,12 @@ thread_get_recent_cpu (void)
   return fp_to_int_nearest (fp_mult_int (thread_current ()->recent_cpu_time, 100));
 }
 
-/** Updates each threads' recent_cpu evert SEC */
+/** Updates each threads' recent_cpu evert SEC, with the formula: 
+ 
+    recent_cpu = (2*load_avg)/(2*load_avg + 1) * recent_cpu + nice
+
+    Note that the order of arithmetics is carefully chosen to avoid
+    overflow. */
 void thread_action_update_cpu (struct thread *t, void *aux UNUSED)
 {
   if (!thread_mlfqs || t == idle_thread)
@@ -747,22 +706,25 @@ init_thread (struct thread *t, const char *name, int priority)
   t->alarm = (int64_t) -1;
   sema_init (&t->wakeup, 0);
 
-  t->donatee_lock = NULL;
-  list_init (&t->donators);
-  t->nice = 0;
-  t->recent_cpu_time = fp_to_int_zero (0);
   if (!thread_mlfqs)
     {
       /* Priority scheduling */
       t->base_priority = priority;
       t->priority = priority;
+      t->donatee_lock = NULL;
+      list_init (&t->donators);
     }
   else
     {
       /* Multilevel feeback queue */
       t->base_priority = PRI_MIN;
       t->priority = PRI_MIN;
+      t->nice = 0;
+      t->recent_cpu_time = fp_to_int_zero (0);
 
+      /* t is marked as BLOCKED and start with PRI_MIN, 
+         so thread_recalc_priority() would neither yield, 
+         not mess up mlf_queue and mlf_bitmap. */
       thread_recalc_priority (t, NULL);
     }
 
@@ -790,7 +752,7 @@ alloc_frame (struct thread *t, size_t size)
    return a thread from the run queue, unless the run queue is
    empty.  (If the running thread can continue running, then it
    will be in the run queue.)  If the run queue is empty, return
-   idle_thread. */
+   idle_thread. Must be invoked with interrupts disabled. */
 static struct thread *
 next_thread_to_run (bool pop)
 {
@@ -810,31 +772,29 @@ next_thread_to_run (bool pop)
       /* Multilevel feedback queue */
 
       /* No ready threads, schedule idle_thread. */
-      if (mlf_bitmap_upper == 0 && mlf_bitmap_lower == 0)
+      if (mlf_bitmap == 0)
         return idle_thread;
 
-      /* Else, must have ready thread(s). Find the highest bit set. */
-      unsigned int r, shift;
-      unsigned int v = mlf_bitmap_upper ? mlf_bitmap_upper : mlf_bitmap_lower;
-      unsigned int bias = mlf_bitmap_upper ? 32 : 0;
-
-      r     = (v > 0xFFFF) << 4; v >>= r;
-      shift = (v > 0xFF  ) << 3; v >>= shift; r |= shift;
-      shift = (v > 0xF   ) << 2; v >>= shift; r |= shift;
-      shift = (v > 0x3   ) << 1; v >>= shift; r |= shift;
-                                              r |= (v >> 1);
+      /* Else, must have ready thread(s). */
       
-      int level = bias + r;
+      /* Find the highest bit set */
+      
+      /* http://graphics.stanford.edu/~seander/bithacks.html#IntegerLog */
+      /* by Eric Cole. This code is written particularly to avoid branching. */   
+      uint64_t r, shift;
+      uint64_t v = mlf_bitmap;
+      r     = (v > 0xFFFFFFFF) << 5; v >>= r;
+      shift = (v > 0xFFFF    ) << 4; v >>= shift; r |= shift;
+      shift = (v > 0xFF      ) << 3; v >>= shift; r |= shift;
+      shift = (v > 0xF       ) << 2; v >>= shift; r |= shift;
+      shift = (v > 0x3       ) << 1; v >>= shift; r |= shift;
+                                                  r |= (v >> 1);
+      int level = r;
 
       struct list_elem *e = pop ? list_pop_front (&mlf_queues[level]) : 
                                   list_front (&mlf_queues[level]);
       if (pop && list_empty (&mlf_queues[level]))
-        {
-          if (level <= 31)
-            mlf_bitmap_lower &= ~(1<<r);
-          else
-            mlf_bitmap_upper &= ~(1<<r);
-        }
+        mlf_bitmap &= ~MLFQS_MASK (level);
       
       return list_entry (e, struct thread, elem);
     }

@@ -7,3 +7,5 @@ tags
 .*.swp
 .DS_Store
 .vscode
+*.bz2
+*/.DS_Store
