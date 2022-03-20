@@ -462,9 +462,9 @@ thread_set_priority (int new_priority)
   struct thread *cur = thread_current ();
 
   cur->base_priority = new_priority;
-  /* Either no donators, or new priority overrides. */
+  /* Either no donors, or new priority overrides. */
   enum intr_level old_level = intr_disable ();
-  if (list_empty (&cur->donators) || cur->priority < new_priority)
+  if (list_empty (&cur->donors) || cur->priority < new_priority)
     cur->priority = new_priority;
   intr_set_level (old_level);
 
@@ -579,7 +579,7 @@ thread_update_load_avg (void)
      *synchronized* thread number on the fly can be error prone. */
   for (int level = PRI_MIN; level <= PRI_MAX; level++)
     ready_threads += list_size (&mlf_queues[level]);
-  
+    
   fp_real tmp1 = fp_div_int (fp_mult_int (load_avg, 59), 60);
   fp_real tmp2 = fp_div_int (fp_to_real (ready_threads), 60);
 
@@ -711,8 +711,8 @@ init_thread (struct thread *t, const char *name, int priority)
       /* Priority scheduling */
       t->base_priority = priority;
       t->priority = priority;
-      t->donatee_lock = NULL;
-      list_init (&t->donators);
+      t->donee_lock = NULL;
+      list_init (&t->donors);
     }
   else
     {

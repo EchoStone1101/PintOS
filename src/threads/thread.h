@@ -102,8 +102,8 @@ struct thread
     int priority;                       /**< Effective priority. */
     
     int base_priority;                  /**< Base priority for donation. */
-    struct list donators;               /**< List of locks which gives donation. */
-    struct lock *donatee_lock;          /**< The list_elem of the lock receiving donation. */
+    struct list donors;                 /**< List of locks which gives donation. */
+    struct lock *donee_lock;            /**< The lock receiving donation. */
     
     int nice;                           /**< The nice value for MLFQS */
     fp_real recent_cpu_time;            /**< The rolling average recent cpu time for MLFQS */

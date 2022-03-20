@@ -167,7 +167,7 @@ sema_test_helper (void *sema_)
     }
 }
 
-/** list_less_func for sorting locks in donators */
+/** list_less_func for sorting locks in donors */
 static bool lock_greater_func (const struct list_elem *a,
                                const struct list_elem *b,
                                void *aux UNUSED);
@@ -176,7 +176,7 @@ static bool lock_greater_func (const struct list_elem *a,
 static void lock_give_donation (struct lock *);
 
 /** Wrapper routine for cancelling donation */
-static void lock_cancel_donation (struct lock *);
+static int lock_cancel_donation (struct lock *);
 
 /** Initializes LOCK.  A lock can be held by at most a single
    thread at any given time.  Our locks are not "recursive", that
@@ -199,7 +199,7 @@ lock_init (struct lock *lock)
   ASSERT (lock != NULL);
 
   lock->holder = NULL;
-  lock->donated_priority = PRI_MIN;
+  lock->donated_priority = -1;
   sema_init (&lock->semaphore, 1);
 }
 
@@ -218,6 +218,15 @@ lock_acquire (struct lock *lock)
   ASSERT (!intr_context ());
   ASSERT (!lock_held_by_current_thread (lock));
 
+  /* We disable interrupts here to avoid the following race condition:
+     Suppose a timer interrupt comes BETWEEN a non-blocking sema_down()
+     and setting lock->holder, and a higher priority thread is scheduled
+     and try to donate. This donation will fill because lock->holder is 
+     not yet set.
+     Without turning off interrupts, we essentially have to set lock->holder
+     before any other thread tries to give donation, which is impossible
+     to guarantee. */
+  enum intr_level old_level = intr_disable ();
   if (!thread_mlfqs)
     lock_give_donation (lock);
 
@@ -225,11 +234,18 @@ lock_acquire (struct lock *lock)
   sema_down (&lock->semaphore);
 
   /* Lock acquired */
-  lock->holder = thread_current ();
+  struct thread *cur = thread_current ();
+  lock->holder = cur;
   
-  /* The holder is now not donating to any lock. */
   if (!thread_mlfqs)
-    lock->holder->donatee_lock = NULL;
+    {
+      /* The holder is now not donating to any lock. */
+      cur->donee_lock = NULL;
+      /* ... but will have LOCK as its one of its own donors. */
+      list_insert_ordered (&cur->donors, &lock->lockelem,
+                            lock_greater_func, NULL);
+    }
+  intr_set_level (old_level);
 }
 
 /** Tries to acquires LOCK and returns true if successful or false
@@ -266,13 +282,21 @@ lock_release (struct lock *lock)
   ASSERT (lock_held_by_current_thread (lock));
 
   lock->holder = NULL;
+  int new_priority;
 
   if (!thread_mlfqs)
-    lock_cancel_donation (lock);
+    new_priority = lock_cancel_donation (lock);
 
-  /* sema_up() invokes potential_thread_yield(); at the case of
-     a cancelled donation, this will cause the expected yield. */
   sema_up (&lock->semaphore);
+
+  /* At the time of a cancelled donation, this is where we set the new 
+     priority, or we might get preempted in sema_up(). */
+  if (!thread_mlfqs)
+    {
+      struct thread *cur = thread_current ();
+      cur->priority = new_priority;
+      potential_thread_yield ();
+    }
 }
 
 /** Returns true if the current thread holds LOCK, false
@@ -286,7 +310,7 @@ lock_held_by_current_thread (const struct lock *lock)
   return lock->holder == thread_current ();
 }
 
-/** list_less_func for sorting locks in donators */
+/** list_less_func for sorting locks in donors */
 static bool lock_greater_func (const struct list_elem *a,
                                const struct list_elem *b,
                                void *aux UNUSED)
@@ -304,54 +328,49 @@ static bool lock_greater_func (const struct list_elem *a,
 static void
 lock_give_donation (struct lock * lock)
 {
-  enum intr_level old_level = intr_disable ();
-
   struct lock *cur_lock = lock;
-  struct thread *donatee = cur_lock->holder;
+  struct thread *donee = cur_lock->holder;
   struct thread *cur_thread = thread_current ();
   
-  /* Record donatee_lock even if unable to overide.
+  /* Record donee_lock even if unable to overide.
      If later the current thread is donated, nested donation 
      can pass on. */
-  if(donatee != NULL)
-    cur_thread->donatee_lock = cur_lock;
+  if(donee != NULL)
+    cur_thread->donee_lock = cur_lock;
 
-  /* (Recursively) give donation if current donation overides */
+  /* (Recursively) give donation if current donation overrides */
   while (cur_lock != NULL && cur_thread->priority > cur_lock->donated_priority) 
     {
-      donatee = cur_lock->holder;
-      if (donatee == NULL || donatee->priority >= cur_thread->priority)
+      donee = cur_lock->holder;
+      if (donee == NULL)
         break;
 
       /* Record new priority */
-      bool overide = (cur_lock->donated_priority > PRI_MIN);
       cur_lock->donated_priority = cur_thread->priority;
-      if (overide)
-        list_remove (&cur_lock->lockelem);
-      list_insert_ordered (&donatee->donators, &cur_lock->lockelem,
+      //ASSERT (!list_empty (&donee->donors));
+      list_remove (&cur_lock->lockelem);
+      list_insert_ordered (&donee->donors, &cur_lock->lockelem,
                             lock_greater_func, NULL);
 
-      /* Donatee's priority might change */
-      int new_priority = list_entry (list_front (&donatee->donators), 
+      /* donee's priority might change */
+      int new_priority = list_entry (list_front (&donee->donors), 
                                      struct lock, lockelem)->donated_priority;
-      if (new_priority > donatee->priority)
+      if (new_priority > donee->priority)
         {
-          donatee->priority = new_priority;
-          /* Reshuffle donatee if it is READY */
-          if (donatee->status == THREAD_READY)
+          donee->priority = new_priority;
+          /* Reshuffle donee if it is READY */
+          if (donee->status == THREAD_READY)
             {
-              list_remove (&donatee->elem);
-              thread_schedule_reshuffle (donatee);
+              list_remove (&donee->elem);
+              thread_schedule_reshuffle (donee);
             }
-          /* Else, donatee gets reshuffled later when ready */
+          /* Else, donee gets reshuffled later when ready */
         }
       
       /* Nested donation: pass it on */
-      cur_thread = donatee;
-      cur_lock = donatee->donatee_lock;
+      cur_thread = donee;
+      cur_lock = donee->donee_lock;
     }
-
-  intr_set_level (old_level);
 }
 
 /** Wrapper rountine for cancelling donation. Only called when
@@ -359,41 +378,36 @@ lock_give_donation (struct lock * lock)
     Since we are not calling this function recursively to deal 
     with nested donations, we support nested donation with 
     arbitrary depth. */
-static void
+static int
 lock_cancel_donation (struct lock * lock)
 {
   enum intr_level old_level = intr_disable ();
 
-  /* No donation is done. */
-  if (lock->donated_priority == PRI_MIN)
-    {
-      intr_set_level (old_level);
-      return;
-    }
-
-  /* Detach from current thread's donators */
+  /* Detach from current thread's donors */
+  struct thread *cur = thread_current ();
+  //ASSERT (!list_empty (&cur->donors));
   list_remove (&lock->lockelem);
 
   /* Clear donated priority record, so that later propagation of 
      donation will properly add lockelem to new holder of this lock. */
-  lock->donated_priority = PRI_MIN;
+  lock->donated_priority = -1;
 
   /* Current thread priority might change */
-  struct thread *cur = thread_current ();
-  int donated_priority; 
+  int donated_priority, new_priority;
 
-  /* Donatee could set its priority to be higher than the donated
+  /* donee could set its priority to be higher than the donated
      priority afterwards, so we don't simply fall back to the new
-     top donator's priority. */
-  if (list_empty (&cur->donators) || 
-      (donated_priority = list_entry (list_front (&cur->donators), 
+     top donor's priority. */
+  if (list_empty (&cur->donors) || 
+      (donated_priority = list_entry (list_front (&cur->donors), 
                           struct lock, lockelem)->donated_priority)
        < cur->base_priority)
-    cur->priority = cur->base_priority;
+    new_priority = cur->base_priority;
   else
-    cur->priority = donated_priority;
+    new_priority = donated_priority;
 
   intr_set_level (old_level);
+  return new_priority;
 }
 
 /** One semaphore in a list. */
