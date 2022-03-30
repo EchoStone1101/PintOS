@@ -62,7 +62,6 @@ static void paging_init (void);
 
 static char **read_command_line (void);
 static char **parse_options (char **argv);
-static int ks_parseline (const char *cmdline, struct cmdline_tokens *tok);
 static void run_actions (char **argv);
 static void run_monitor (void);
 static void usage (void);
@@ -101,8 +100,9 @@ pintos_init (void)
   malloc_init ();
   paging_init ();
 
-  /* Segmentation. */
+ 
 #ifdef USERPROG
+  /* Segmentation. */
   tss_init ();
   gdt_init ();
 #endif
@@ -150,14 +150,15 @@ pintos_init (void)
  *  Returns when user types "exit". */
 static void run_monitor (void) {
   const char prompt[] = "PKUOS> ";
-  char* input = (char*) malloc ((size_t)KS_BUFFER_SIZE);
+  char* input = (char*) malloc ((size_t)CMD_BUFFER_SIZE);
+  struct cmdline_tokens* tok = malloc (sizeof (struct cmdline_tokens));
 
   printf ("\n");
   while (true) {
     printf ("%s", prompt);
     char ch;
 
-    memset(input, 0, KS_BUFFER_SIZE * sizeof(char));
+    memset(input, 0, CMD_BUFFER_SIZE * sizeof(char));
 
     /* Marker for advanced edit */
     int cursor = 0, end = 0;
@@ -210,7 +211,7 @@ static void run_monitor (void) {
         }
       }
       // Normal input
-      else if (end < KS_BUFFER_SIZE - 1) { 
+      else if (end < CMD_BUFFER_SIZE - 1) { 
         // refresh displayed characters
         end++;
         for (int i = cursor; i < end; i++) {
@@ -230,20 +231,18 @@ static void run_monitor (void) {
     printf ("\n");
 
     /* Parses the input */
-    struct cmdline_tokens tok;
-
-    int state = ks_parseline(input, &tok);
+    int state = cmd_parseline(input, tok);
 
     if (state == -1) /* parsing error */
       break;
-    if (tok.argv[0] == NULL) /* ignore empty lines */
+    if (tok->argv[0] == NULL) /* ignore empty lines */
       continue;
 
     /* Execute built-in commands */ 
-    switch(tok.builtins) {
-      case BUILTIN_EXIT: free(input); return;
+    switch(tok->builtins) {
+      case BUILTIN_EXIT: free(input); free(tok); return;
       case BUILTIN_WHOAMI: printf ("2000012959\n"); break;
-      case BUILTIN_NONE: printf ("%s: invalid command\n", tok.argv[0]); break;
+      case BUILTIN_NONE: printf ("%s: invalid command\n", tok->argv[0]); break;
     }
   }
 }
@@ -388,23 +387,22 @@ parse_options (char **argv)
   return argv;
 }
 
-/** parseline - Parse the command line and build the argv array,
-    returns -1 if cmdline is incorrectly formatted */
-static int 
-ks_parseline(const char *cmdline, struct cmdline_tokens *tok) 
+/** Parse the command line and build the argv array,
+    returns -1 if cmdline is incorrectly formatted.
+    Note that is function alters CMDLINE in place. */
+int 
+cmd_parseline(char *cmdline, struct cmdline_tokens *tok) 
 {
-  static char array[KS_BUFFER_SIZE];   /* holds local copy of command line */
   const char delims[10] = " \t\r\n";   /* argument delimiters (white-space) */
-  char *buf = array;                   /* ptr that traverses command line */
+  char *buf = cmdline;                 /* ptr that traverses command line */
   char *next;                          /* ptr to the end of the current arg */
   char *endbuf;                        /* ptr to end of cmdline string */
 
   if (cmdline == NULL) {
-    printf("Error: command line is NULL\n");
+    printf ("Error: command line is NULL\n");
     return -1;
   }
 
-  strlcpy(buf, cmdline, KS_BUFFER_SIZE);
   endbuf = buf + strlen(buf);
 
   /* Build the argv list */
@@ -434,11 +432,11 @@ ks_parseline(const char *cmdline, struct cmdline_tokens *tok)
     /* Terminate the token */
     *next = '\0';
 
-    /* Record the token as either the next argument */
+    /* Record the token as the next argument */
     tok->argv[tok->argc++] = buf;
 
     /* Check if argv is full */
-    if (tok->argc >= KS_MAXARGS-1) break;
+    if (tok->argc >= CMD_MAXARGS-1) break;
 
     buf = next + 1;
   }

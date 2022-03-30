@@ -1,4 +1,5 @@
 #include "userprog/exception.h"
+#include "userprog/process.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include "userprog/gdt.h"
@@ -89,6 +90,12 @@ kill (struct intr_frame *f)
       printf ("%s: dying due to interrupt %#04x (%s).\n",
               thread_name (), f->vec_no, intr_name (f->vec_no));
       intr_dump_frame (f);
+
+      /* Killed by kernel, return status must be -1. */
+      struct proc_stat_slot *pss = thread_current ()->pss;
+      ASSERT (pss != NULL);
+      pss->status = -1;
+
       thread_exit (); 
 
     case SEL_KCSEG:
@@ -148,14 +155,37 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
-  printf ("Page fault at %p: %s error %s page in %s context.\n",
-          fault_addr,
-          not_present ? "not present" : "rights violation",
-          write ? "writing" : "reading",
-          user ? "user" : "kernel");
-  kill (f);
+  
+  /* For kernel page faults during a syscall, we want to send error
+     code back to the faulting access, which is done in tandem with
+     get_user() and put_user() calls. 
+
+     Specifically, we expect f->eax to hold the first instruction 
+     after the faulting instruction, so that we set f->eip to it
+     in order to skip the faulting access. We also set f->eax to
+     be -1 as error code. */
+  if (thread_current ()->syscall && !user) 
+   {
+      f->eip = (void (*) (void)) f->eax;
+      f->eax = -1;
+      return;
+   }
+  else
+   {
+      /* Otherwise, current behavior is always killing the faulting
+         thread. If the fault comes from kernel code, kill() will
+         panic. */
+       kill (f);
+       
+      /* To implement virtual memory, delete the rest of the function
+         body, and replace it with code that brings in the page to
+         which fault_addr refers. */
+      printf ("Page fault at %p: %s error %s page in %s context.\n",
+               fault_addr,
+               not_present ? "not present" : "rights violation",
+               write ? "writing" : "reading",
+               user ? "user" : "kernel");
+   }
+      
 }
 

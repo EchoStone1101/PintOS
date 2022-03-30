@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <hash.h>
+#include <list.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/tss.h"
@@ -15,33 +17,76 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/synch.h"
+
+// #define PSS_DEBUG
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static void * load_arguments (struct cmdline_tokens* tok);
+
+/** Helper struct for creating a process. 
+    Fits in one page. */
+struct proc_start_page
+  {
+    char cmdline[CMD_BUFFER_SIZE];    /**< Buffer for command line. */
+    struct cmdline_tokens tok;        /**< Buffer for parsed tokens. */
+    struct semaphore loaded;          /**< For syncing between parent and child. */
+    bool success;                     /**< Whether child is loaded successfully. */
+  };
 
 /** Starts a new thread running a user program loaded from
-   FILENAME.  The new thread may be scheduled (and may even exit)
-   before process_execute() returns.  Returns the new process's
-   thread id, or TID_ERROR if the thread cannot be created. */
+   FILENAME. Returns the new process's thread id, or TID_ERROR 
+   if the thread cannot be created or loaded.
+   The new thread may be scheduled (and may even exit)
+   before process_execute() returns. However, it is guaranteed
+   to block until the new process is loaded (or fails to do so). */
 tid_t
 process_execute (const char *file_name) 
 {
-  char *fn_copy;
+  struct proc_start_page *page;
   tid_t tid;
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
-  fn_copy = palloc_get_page (0);
-  if (fn_copy == NULL)
+  /* Parse FILE_NAME into [prog] [arg1, arg2, ...].
+     First make a copy of FILE_NAME, otherwise there's a race between 
+     the caller and load(). */
+  page = palloc_get_page (0);
+  if (page == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
+  strlcpy (page->cmdline, file_name, CMD_BUFFER_SIZE);
 
-  /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+  /* Parse command line. It is modified in place. */
+  int state = cmd_parseline(page->cmdline, &page->tok);
+
+  /* Parsing error or FILE_NAME is empty. */
+  if (state == -1 || page->tok.argc == 0)
+    {
+      tid = TID_ERROR;
+      printf ("process_execute: parsing error\n");
+      goto done;
+    }
+
+  sema_init (&page->loaded, 0);                                        
+
+  /* Create a new thread to execute FILE_NAME. The arguments are loaded 
+     in start_process(), as now the thread's PD is not created and activated
+     yet, let alone its stack. */
+  tid = thread_create ((const char *)page, PRI_DEFAULT, start_process, page);
+  sema_down (&page->loaded);
+
+  /* If loading fails, also return -1. */
+  if (!page->success)
+    tid = TID_ERROR;
+
+ done:
+  palloc_free_page (page);
+
+  /* By now the child's PSS is allocated, and registered in parent's 
+     children list. Both can exit freely now. */ 
+
   return tid;
 }
 
@@ -50,7 +95,7 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 {
-  char *file_name = file_name_;
+  struct proc_start_page *page = file_name_;
   struct intr_frame if_;
   bool success;
 
@@ -59,12 +104,27 @@ start_process (void *file_name_)
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
 
-  /* If load failed, quit. */
-  palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
+  /* FILE_NAME is effectively the program name because cmd_parseline() 
+     NULL terminates each token. */
+  success = load (page->cmdline, &if_.eip, &if_.esp);
+
+  /* Notify parent about loading result. */
+  page->success = success;
+  sema_up (&page->loaded);
+
+  /* After load() activates the process's PD, we now load arguments onto
+     the USER STACK of the process, and set if_.esp so that later return
+     from the intr_frame correctly jumps to the USER STACK. */
+  if (success)
+    if_.esp = load_arguments (&page->tok);
+  else
+    {
+      struct thread *t = thread_current ();
+      ASSERT (t->pss != NULL);
+      t->pss->status = -1;
+      thread_exit ();  
+    }
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -81,13 +141,49 @@ start_process (void *file_name_)
    exception), returns -1.  If TID is invalid or if it was not a
    child of the calling process, or if process_wait() has already
    been successfully called for the given TID, returns -1
-   immediately, without waiting.
-
-   This function will be implemented in problem 2-2.  For now, it
-   does nothing. */
+   immediately, without waiting. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid)
 {
+  if (child_tid == TID_ERROR)
+    goto bad_wait;
+  
+  /* Go through the children list to see if child_tid is valid. */
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+  bool found = false;
+  for (e = list_begin (&cur->children); e != list_end (&cur->children);
+       e = list_next (e))
+    {
+      if (list_entry (e, struct proc_stat_slot, elem)->tid == child_tid)
+        {
+          found = true;
+          break;
+        }
+    }
+  if(!found)
+    goto bad_wait;
+
+  /* Valid child_tid; wait by DOWNing its CNT. */
+  struct proc_stat_slot *pss = list_entry (e, struct proc_stat_slot, elem);
+  sema_down(&pss->cnt);
+
+  /* By now child has passed its status. */
+  int status = pss->status;
+
+  /* Free the PSS, and remove from children list. 
+     As CNT is downed, child (which might not have completely exited)
+     will not find CNT == 2, hence no double freeing. Parent will also
+     not access freed PSS when exiting, as it is removed. */
+  list_remove (e);
+#ifdef PSS_DEBUG
+  printf ("%s freed slot %d\n", cur->name, pss->tid);
+#endif 
+  free (pss);
+
+  return status;
+ 
+ bad_wait:
   return -1;
 }
 
@@ -98,11 +194,82 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  /* Manage the process status slots. */
+  struct proc_stat_slot *pss = cur->pss;
+  
+  int status = 0;
+  if (pss != NULL)
+    status = pss->status;
+
+  do {
+    /* The initial thread did not allocate a PSS, so don't
+       free it. */
+    if (pss == NULL)
+      continue;
+
+    /* If CNT reaches 2, both parent and child exited. */
+    if (sema_up (&pss->cnt) == 2)
+      {
+        /* Reuse CNT to ensure only one of parent and child
+           frees the slot. */
+        bool success = sema_try_clear (&pss->cnt);
+        if (success)
+          {
+#ifdef PSS_DEBUG
+            printf ("%s freed slot %d\n", cur->name, pss->tid);
+#endif 
+            free (pss);
+          }
+      }
+    
+    /* Note that when process_wait() is interleaved here, once
+       sema_up() returns, pss can be invalid anytime (as it is
+       freed). However, the new value for CNT then will not be
+       2, so subsequent references to pss is bypassed. */
+  
+  /* Subsequently UPs all children's CNT. */
+  } while (!list_empty (&cur->children) &&
+           (pss = list_entry (list_pop_front (&cur->children), 
+                              struct proc_stat_slot, elem)));
+
+
+  /* Interestingly (and reassuringly), user processes can only acquire
+     locks via controlled ways, i.e. the syscall (printf(), for example,
+     boils down to WRITE, which then acquires the console lock in 
+     kernel). Hence, as long as we check for memory validity thoroughly
+     at syscall handlers, we don't need to worry about process exiting
+     before it releases its lock. */
+
+
+  /* Close opened files. */
+  lock_acquire (&filesys_lock);
+
+  /* Close the file of current process, thus re-enabling writes. */
+  file_close (cur->file_self);
+
+  if (cur->fdt != NULL)
+    {
+      for (unsigned int i = STDOUT_FILENO + 1; 
+           i < (sizeof (struct fd_table)>>2); i++)
+        {
+          if (cur->fdt->fde[i] != NULL)
+            file_close (cur->fdt->fde[i]);
+        }
+      /* Finally, free the FDT page. */
+      palloc_free_page (cur->fdt);
+    }
+
+  lock_release (&filesys_lock);
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
   if (pd != NULL) 
     {
+      /* Which means current thread is also a user process.
+         Print termination message. */
+      printf ("%s: exit(%d)\n", cur->name, status);
+
       /* Correct ordering here is crucial.  We must set
          cur->pagedir to NULL before switching page directories,
          so that a timer interrupt can't switch back to the
@@ -131,7 +298,7 @@ process_activate (void)
      interrupts. */
   tss_update ();
 }
-
+
 /** We load ELF binaries.  The following definitions are taken
    from the ELF specification, [ELF1], more-or-less verbatim.  */
 
@@ -222,13 +389,18 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
-  file = filesys_open (file_name);
-  if (file == NULL) 
+  lock_acquire (&filesys_lock);
+
+  t->file_self = file = filesys_open (file_name);
+  /* Deny writes to executable. */
+  if (file != NULL)
+    file_deny_write (file);
+  else
     {
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
-
+  
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
@@ -312,10 +484,21 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  
+  /* For denying writes to executables, the process file must keep 
+     opened, and gets closed when it finishes running. */
+  if(!success)
+    /* Closing NULL is allowed. */
+    {
+      file_close (file);
+      t->file_self = NULL;
+      /* ... so that process_exit() will not close it again. */
+    }
+  
+  lock_release (&filesys_lock);
   return success;
 }
-
+
 /** load() helpers. */
 
 static bool install_page (void *upage, void *kpage, bool writable);
@@ -442,6 +625,55 @@ setup_stack (void **esp)
         palloc_free_page (kpage);
     }
   return success;
+}
+
+/** Load the process program arguments at the top of its stack. 
+    Only invoked in start_process() after setup_stack() and before
+    process program runs for the first time. 
+    Returns the new stack top. */
+static void *
+load_arguments (struct cmdline_tokens* tok)
+{
+  /* Loading starts at stack top. */
+  uint32_t top = (uint32_t) PHYS_BASE;
+
+  /* Load the actual strings */
+  int argc = tok->argc;
+  for (int i = argc - 1; i >= 0; i--)
+    {
+      /* Include terminating '\0'. */
+      size_t len = strlen (tok->argv[i]) + 1;
+      top -= len;
+      strlcpy ((char *)top, tok->argv[i], len);
+
+      /* Set argv[i] for later loading. */
+      tok->argv[i] = (char *)top;
+    }
+  
+  /* Word alignment*/
+  top -= top % sizeof (void *);
+
+  /* Load ARGV[i], including the terminating NULL */
+  for (int i = argc; i >= 0; i--)
+    {
+      top -= sizeof (char *);
+      *(char **)top = tok->argv[i];
+    }
+  
+  /* Load ARGV */
+  char **argv = (char **)top;
+  top -= sizeof (char **);
+  *(char ***)top = argv;
+
+  /* Load ARGC */
+  top -= sizeof (int);
+  *(int *)top = tok->argc;
+
+  /* Load dummy return address */
+  top -= sizeof (void *);
+  *(void **)top = NULL;
+
+  return (void *) top;
 }
 
 /** Adds a mapping from user virtual address UPAGE to kernel

@@ -33,6 +33,7 @@ pagedir_destroy (uint32_t *pd)
     return;
 
   ASSERT (pd != init_page_dir);
+  /* Free PDEs up to kernel PDEs, bounded by pd_no (PHYS_BASE) */
   for (pde = pd; pde < pd + pd_no (PHYS_BASE); pde++)
     if (*pde & PTE_P) 
       {
@@ -51,8 +52,9 @@ pagedir_destroy (uint32_t *pd)
    address VADDR in page directory PD.
    If PD does not have a page table for VADDR, behavior depends
    on CREATE.  If CREATE is true, then a new page table is
-   created and a pointer into it is returned.  Otherwise, a null
-   pointer is returned. */
+   created and a pointer into it is returned (creation may still
+   fail and null is returned). Otherwise, a null pointer is 
+   returned. */
 static uint32_t *
 lookup_page (uint32_t *pd, const void *vaddr, bool create)
 {
@@ -152,6 +154,7 @@ pagedir_clear_page (uint32_t *pd, void *upage)
   if (pte != NULL && (*pte & PTE_P) != 0)
     {
       *pte &= ~PTE_P;
+      /* Touch upon %cr3 to refreash TLB */
       invalidate_pagedir (pd);
     }
 }
@@ -215,7 +218,7 @@ pagedir_set_accessed (uint32_t *pd, const void *vpage, bool accessed)
 }
 
 /** Loads page directory PD into the CPU's page directory base
-   register. */
+   register. If PD is null, init_page_dir is loaded. */
 void
 pagedir_activate (uint32_t *pd) 
 {
@@ -243,7 +246,7 @@ active_pd (void)
   return ptov (pd);
 }
 
-/** Seom page table changes can cause the CPU's translation
+/** Some page table changes can cause the CPU's translation
    lookaside buffer (TLB) to become out-of-sync with the page
    table.  When this happens, we have to "invalidate" the TLB by
    re-activating it.

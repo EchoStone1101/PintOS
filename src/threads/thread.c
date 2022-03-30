@@ -4,6 +4,7 @@
 #include <random.h>
 #include <stdio.h>
 #include <string.h>
+#include <hash.h>
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
@@ -11,6 +12,7 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -208,6 +210,9 @@ thread_create (const char *name, int priority,
 
   ASSERT (function != NULL);
 
+  /* Get a new tid. */
+  tid = allocate_tid ();
+
   /* Allocate thread. */
   t = palloc_get_page (PAL_ZERO);
   if (t == NULL)
@@ -216,11 +221,44 @@ thread_create (const char *name, int priority,
   /* Initialize thread. */
   init_thread (t, name, priority);
 
+#ifdef USERPROG
+  /* Allocate process status slot. */
+  struct proc_stat_slot *pss = (struct proc_stat_slot *) 
+                                malloc (sizeof (struct proc_stat_slot));
+  if (pss == NULL)
+    /* Allocation failed. */
+    {
+      palloc_free_page (t);
+      return TID_ERROR;
+    }
+
+  /* Initialize slot. */
+  pss->tid = tid;
+  sema_init (&pss->cnt, 0);
+  pss->status = 0;
+
+  /* Set up parent and child's access to PSS.
+     Note that we rely on the following assumption: that thread_create() 
+     do not interleave with thread_exit(). Here, parent is halfway through
+     thread_create() and not exiting any time before, while child is not
+     run until thread_unblock(), and no other thread should manipulate
+     PSS and CHILDREN or cause parent to exit.
+
+     If, however, certain EXTERNAL INTERRUPT causes parent to exit, then
+     PSS might not be correctly freed. Luckily for what we know, external 
+     interrupts only enforce termination at really bad times (e.g. machine 
+     on fire), where we no longer have to care. 
+
+     Finally, one can always turn off interrupts here if really needed. */
+  t->pss = pss;
+  list_push_back (&thread_current ()->children, &pss->elem);
+#endif
+
   /* Nice and recent_cpu is inherited. */
   t->nice = thread_get_nice ();
   t->recent_cpu_time = thread_current ()->recent_cpu_time;
 
-  tid = t->tid = allocate_tid ();
+  t->tid = tid;
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
@@ -236,6 +274,7 @@ thread_create (const char *name, int priority,
   sf = alloc_frame (t, sizeof *sf);
   sf->eip = switch_entry;
   sf->ebp = 0;
+
 
   /* Add to run queue. */
   thread_unblock (t);
@@ -705,6 +744,17 @@ init_thread (struct thread *t, const char *name, int priority)
   
   t->alarm = (int64_t) -1;
   sema_init (&t->wakeup, 0);
+
+#ifdef USERPROG
+  /* Initialize the rest of process properties. 
+     This has to go here because the initial thread must 
+     also have these initialized. */
+  t->syscall = false;
+  t->pss = NULL;
+  list_init (&t->children);
+  t->fdt = NULL;
+  t->file_self = NULL;
+#endif
 
   if (!thread_mlfqs)
     {

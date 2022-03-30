@@ -101,11 +101,37 @@ sema_try_down (struct semaphore *sema)
   return success;
 }
 
+/** Clears the value of the semaphore, but only if the
+   semaphore is not already 0.  Returns true if the semaphore is
+   cleared, false otherwise.
+
+   This function may be called from an interrupt handler. */
+bool
+sema_try_clear (struct semaphore *sema) 
+{
+  enum intr_level old_level;
+  bool success;
+
+  ASSERT (sema != NULL);
+
+  old_level = intr_disable ();
+  if (sema->value > 0) 
+    {
+      sema->value = 0;
+      success = true; 
+    }
+  else
+    success = false;
+  intr_set_level (old_level);
+
+  return success;
+}
+
 /** Up or "V" operation on a semaphore.  Increments SEMA's value
    and wakes up one thread of those waiting for SEMA, if any.
 
    This function may be called from an interrupt handler. */
-void
+int
 sema_up (struct semaphore *sema) 
 {
   enum intr_level old_level;
@@ -125,9 +151,12 @@ sema_up (struct semaphore *sema)
     }
     
   sema->value++;
+  int new_value = sema->value;
+  
   potential_thread_yield ();
 
   intr_set_level (old_level);
+  return new_value;
 }
 
 static void sema_test_helper (void *sema_);
@@ -385,7 +414,7 @@ lock_cancel_donation (struct lock * lock)
 
   /* Detach from current thread's donors */
   struct thread *cur = thread_current ();
-  //ASSERT (!list_empty (&cur->donors));
+
   list_remove (&lock->lockelem);
 
   /* Clear donated priority record, so that later propagation of 
