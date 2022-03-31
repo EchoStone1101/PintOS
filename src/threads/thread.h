@@ -122,8 +122,10 @@ struct thread
     uint32_t *pagedir;                  /**< Page directory. */
 
     bool syscall;                       /**< Set to true when in syscall, for PF handler. */
+
     struct list children;               /**< List of all children processes. */
     struct proc_stat_slot *pss;         /**< Process status slot of current process. */
+
     struct fd_table *fdt;               /**< Opened file descriptor table. */
     void *file_self;                    /**< File that the process is loaded from. */
 #endif

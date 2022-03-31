@@ -57,10 +57,15 @@ static void syscall_seek (int fd, unsigned position);
 static unsigned syscall_tell (int fd);
 static void syscall_close (int fd);
 
+/* Placeholder for un-implemented syscalls. */
+static void syscall_unhandled (void);
+
 static const void * syscall_worker [] = {
   syscall_halt, syscall_exit, syscall_exec, syscall_wait, syscall_create,
   syscall_remove, syscall_open, syscall_filesize, syscall_read, syscall_write,
   syscall_seek, syscall_tell, syscall_close,
+  syscall_unhandled, syscall_unhandled, syscall_unhandled, syscall_unhandled,
+  syscall_unhandled, syscall_unhandled, syscall_unhandled,
 };
 
 /* Reads a byte at user virtual address UADDR.
@@ -221,7 +226,7 @@ syscall_handler (struct intr_frame *f)
   struct syscall_frame
     {
       /* ARGS at bottom to be passed to workers. OLD_ESP and RET
-         at top, saved from calling workers. */
+         at top, saved from the frame of worker. */
       void *args[3];
       void *old_esp;
       unsigned ret;
@@ -234,7 +239,10 @@ syscall_handler (struct intr_frame *f)
         syscall_terminate ();
     }
 
-  /* Assembly magic to call worker with ARGS as arguments. */
+  /* Assembly magic to call worker with ARGS as arguments.
+     Basically, the worker is invoked with assembly "call", bypassing
+     any type check / conversion needed. Point %esp to start of ARGS,
+     issue "call", restore %esp, and it's done. */
   asm ("movl %%esp, %0; movl %1, %%esp;"
        : "=m" (syscall_f.old_esp) : "q" (syscall_f.args));
   asm ("call *%1; movl %2, %%esp; movl %%eax, %0;"
@@ -252,7 +260,8 @@ syscall_handler (struct intr_frame *f)
 
 /** Worker for HALT. 
     Terminates pintos by calling shutdown_power_off(). */
-static void syscall_halt (void)
+static void 
+syscall_halt (void)
 {
   /* The file system is safely closed within shutdown_power_off (),
      and there should be no more to save before shutdown. */
@@ -264,7 +273,8 @@ static void syscall_halt (void)
     This worker simply passes STATUS to the process status slot in heap,
     and calls thread_exit(), in which process_exit() decides what to do
     with the process status slots. */
-static void syscall_exit (int status)
+static void 
+syscall_exit (int status)
 {
   thread_current ()->pss->status = status;
   thread_exit ();
@@ -275,7 +285,8 @@ static void syscall_exit (int status)
     arguments, and returns the new process's program id (pid). 
     If the program cannot load or run for any reason, must return pid -1, 
     which otherwise should not be a valid pid. */
-static pid_t syscall_exec (const char *cmd_line)
+static pid_t 
+syscall_exec (const char *cmd_line)
 {
   /* Must first check for the validity of CMD_LINE. */
   if (!check_user_read_buffer (cmd_line, CMD_BUFFER_SIZE, true))
@@ -290,7 +301,8 @@ static pid_t syscall_exec (const char *cmd_line)
 
 /** Worker for WAIT. 
     Waits for a child process pid and retrieves the child's exit status. */
-static int syscall_wait (pid_t pid)
+static int 
+syscall_wait (pid_t pid)
 {
   tid_t child_tid = (tid_t) pid;
 
@@ -304,8 +316,8 @@ static int syscall_wait (pid_t pid)
     Returns true if successful, false otherwise. 
     Creating a new file does not open it: opening the new file is a separate 
     operation which would require a open system call. */
-static bool syscall_create (const char *file, 
-                            unsigned initial_size)
+static bool 
+syscall_create (const char *file, unsigned initial_size)
 {
   if (!check_user_read_buffer (file, NAME_MAX, true))
     syscall_terminate ();
@@ -321,7 +333,8 @@ static bool syscall_create (const char *file,
     Deletes the file called file. Returns true if successful, false otherwise. 
     A file may be removed regardless of whether it is open or closed, and 
     removing an open file does not close it. */
-static bool syscall_remove (const char *file)
+static bool 
+syscall_remove (const char *file)
 {
   if (!check_user_read_buffer (file, NAME_MAX, true))
     syscall_terminate ();
@@ -338,7 +351,8 @@ static bool syscall_remove (const char *file)
     a "file descriptor" (fd), or -1 if the file could not be opened. 
     File descriptors are not inherited by child processes 
     (different from Unix semantics)!!! */
-static int syscall_open (const char *file)
+static int 
+syscall_open (const char *file)
 {
   if (!check_user_read_buffer (file, NAME_MAX, true))
     syscall_terminate ();
@@ -394,7 +408,8 @@ static int syscall_open (const char *file)
 
 /** Worker for FILESIZE. 
     Returns the size, in bytes, of the file open as fd. */
-static int syscall_filesize (int fd)
+static int 
+syscall_filesize (int fd)
 {
   /* Invalid FD in terms of FILESIZE. */
   if (!fd_valid(fd) || fd == STDIN_FILENO || fd == STDOUT_FILENO)
@@ -414,7 +429,8 @@ static int syscall_filesize (int fd)
     which non-malicious users have to cope with for safety.
     Returns the number of bytes actually read (0 at end of file), or -1 
     if the file could not be read (due to a condition other than EOF). */
-static int syscall_read (int fd, void *buffer, unsigned size)
+static int 
+syscall_read (int fd, void *buffer, unsigned size)
 {
   /* Invalid FD in terms of READ. */
   if (fd == STDOUT_FILENO || !fd_valid(fd))
@@ -454,7 +470,8 @@ static int syscall_read (int fd, void *buffer, unsigned size)
     is not implemented by the basic file system. The expected behavior is to 
     write as many bytes as possible up to end-of-file and return the actual 
     number written, or 0 if no bytes could be written at all. */
-static int syscall_write(int fd, const void *buffer, unsigned size)
+static int 
+syscall_write(int fd, const void *buffer, unsigned size)
 {
   /* Invalid FD in terms of WRITE. 
      The deny-write behavior is handled in file_write(). */
@@ -489,7 +506,8 @@ static int syscall_write(int fd, const void *buffer, unsigned size)
 /** Worker for SEEK.
     Changes the next byte to be read or written in open file fd to position, 
     expressed in bytes from the beginning of the file. */
-static void syscall_seek (int fd, unsigned position)
+static void 
+syscall_seek (int fd, unsigned position)
 {
   /* Invalid FD in terms of SEEK. */
   if (!fd_valid(fd) || fd == STDIN_FILENO || fd == STDOUT_FILENO)
@@ -505,7 +523,8 @@ static void syscall_seek (int fd, unsigned position)
 /** Worker for TELL.
     Returns the position of the next byte to be read or written in open file 
     fd, expressed in bytes from the beginning of the file. */
-static unsigned syscall_tell (int fd)
+static unsigned 
+syscall_tell (int fd)
 {
   /* Invalid FD in terms of TELL. */
   if (!fd_valid(fd) || fd == STDIN_FILENO || fd == STDOUT_FILENO)
@@ -520,7 +539,8 @@ static unsigned syscall_tell (int fd)
 
 /** Worker for CLOSE.
     Closes file descriptor fd. */
-static void syscall_close (int fd)
+static void 
+syscall_close (int fd)
 {
   /* Invalid FD in terms of CLOSE.
      Specifically, STDIN and STDOUT are not closable. */
@@ -536,4 +556,10 @@ static void syscall_close (int fd)
   t->fdt->fde[fd] = NULL;
 }
 
-
+/** Worker for un-implemented syscalls. 
+    Simply terminate the process. */
+static void
+syscall_unhandled (void)
+{
+  syscall_terminate ();
+}

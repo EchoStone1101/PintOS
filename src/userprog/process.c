@@ -22,7 +22,7 @@
 #include "threads/vaddr.h"
 #include "threads/synch.h"
 
-// #define PSS_DEBUG
+//#define PSS_DEBUG
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -109,17 +109,23 @@ start_process (void *file_name_)
      NULL terminates each token. */
   success = load (page->cmdline, &if_.eip, &if_.esp);
 
-  /* Notify parent about loading result. */
   page->success = success;
-  sema_up (&page->loaded);
 
   /* After load() activates the process's PD, we now load arguments onto
      the USER STACK of the process, and set if_.esp so that later return
      from the intr_frame correctly jumps to the USER STACK. */
   if (success)
-    if_.esp = load_arguments (&page->tok);
+    {
+      if_.esp = load_arguments (&page->tok);
+      
+      /* Notify parent about loading result. 
+         This must happen after load_arguments(). This synchronization bug
+         is found with -mlfqs. */
+      sema_up (&page->loaded);
+    }
   else
     {
+      sema_up (&page->loaded);
       struct thread *t = thread_current ();
       ASSERT (t->pss != NULL);
       t->pss->status = -1;
