@@ -68,6 +68,8 @@ static const void * syscall_worker [] = {
   syscall_unhandled, syscall_unhandled, syscall_unhandled,
 };
 
+extern struct lock filesys_lock;
+
 /* Reads a byte at user virtual address UADDR.
    UADDR must be below PHYS_BASE.
    Returns the byte value if successful, -1 if a segfault

@@ -28,6 +28,9 @@ static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 static void * load_arguments (struct cmdline_tokens* tok);
 
+/* Lock for protecting access to file system, which is not thread-safe. */
+struct lock filesys_lock;
+
 /** Helper struct for creating a process. 
     Fits in one page. */
 struct proc_start_page
@@ -75,11 +78,15 @@ process_execute (const char *file_name)
      in start_process(), as now the thread's PD is not created and activated
      yet, let alone its stack. */
   tid = thread_create ((const char *)page, PRI_DEFAULT, start_process, page);
-  sema_down (&page->loaded);
-
-  /* If loading fails, also return -1. */
-  if (!page->success)
-    tid = TID_ERROR;
+  
+  /* Wait until loading finishes, if thread creation succeeds. */
+  if (tid != TID_ERROR)
+    {
+      sema_down (&page->loaded);
+      /* If loading fails, also return -1. */
+      if (!page->success)
+        tid = TID_ERROR;
+    }
 
  done:
   palloc_free_page (page);
@@ -246,7 +253,6 @@ process_exit (void)
      at syscall handlers, we don't need to worry about process exiting
      before it releases its lock. */
 
-
   /* Close opened files. */
   lock_acquire (&filesys_lock);
 
@@ -391,7 +397,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
-    goto done;
+    return success;
   process_activate ();
 
   /* Open executable file. */

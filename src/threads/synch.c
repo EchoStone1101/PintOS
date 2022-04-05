@@ -69,6 +69,7 @@ sema_down (struct semaphore *sema)
   while (sema->value == 0) 
     {
       list_push_back (&sema->waiters, &thread_current ()->elem);
+      //printf ("sema_down block: %d, for %x\n", thread_tid (), sema);
       thread_block ();
     }
   sema->value--;

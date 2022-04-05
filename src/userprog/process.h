@@ -41,9 +41,6 @@ struct proc_stat_slot
     struct list_elem elem;          /**< List element for parent's children list. */
   };
 
-/* Lock for protecting access to file system, which is not thread-safe. */
-struct lock filesys_lock;
-
 /* Table of opened file descriptors. 
    Takes up exactly one page, meaning that a process can open
    at most 1024 files. Similar constraint is found in Linux. 
