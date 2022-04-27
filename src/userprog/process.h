@@ -9,6 +9,9 @@
 #define STDIN_FILENO 0
 #define STDOUT_FILENO 1
 
+/* User stack is limited to STACK_PG_CNT pages at most. */
+#define STACK_PG_CNT 128
+
 /* Not sure why this typedef is not captured by compiler. */
 typedef int tid_t;
 
@@ -53,7 +56,7 @@ struct proc_stat_slot
    by noting t->fdt == NULL. */
 struct fd_table
   {
-    void * fde[PGSIZE >> 2];         /**< Pointers to file. FD index into this array. */
+    struct file *fde[PGSIZE >> 2];         /**< Pointers to file. FD index into this array. */
   };
 
 tid_t process_execute (const char *file_name);

@@ -203,6 +203,7 @@ thread_create (const char *name, int priority,
                thread_func *function, void *aux) 
 {
   struct thread *t;
+  struct thread *cur = thread_current ();
   struct kernel_thread_frame *kf;
   struct switch_entry_frame *ef;
   struct switch_threads_frame *sf;
@@ -251,12 +252,20 @@ thread_create (const char *name, int priority,
 
      Finally, one can always turn off interrupts here if really needed. */
   t->pss = pss;
-  list_push_back (&thread_current ()->children, &pss->elem);
+  list_push_back (&cur->children, &pss->elem);
+#endif
+
+#ifdef VM
+  /* Initialize vma_list. It is then populated in load() when process
+     actually runs. */
+  list_init (&t->vma_list);
+  t->want_pinned = false;
+  t->esp = NULL;
 #endif
 
   /* Nice and recent_cpu is inherited. */
   t->nice = thread_get_nice ();
-  t->recent_cpu_time = thread_current ()->recent_cpu_time;
+  t->recent_cpu_time = cur->recent_cpu_time;
 
   t->tid = tid;
 

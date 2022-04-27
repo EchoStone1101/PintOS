@@ -337,6 +337,13 @@ inode_allow_write (struct inode *inode)
   inode->deny_write_cnt--;
 }
 
+/** Returns whether INODE is set deny_write. */
+bool
+inode_is_deny_write (struct inode *inode)
+{
+  return inode->deny_write_cnt;
+}
+
 /** Returns the length, in bytes, of INODE's data. */
 off_t
 inode_length (const struct inode *inode)

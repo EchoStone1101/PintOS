@@ -35,6 +35,7 @@ struct pool
 
 /** Two pools: one for kernel data, one for user pages. */
 static struct pool kernel_pool, user_pool;
+static size_t user_pool_size;
 
 static void init_pool (struct pool *, void *base, size_t page_cnt,
                        const char *name);
@@ -148,6 +149,28 @@ palloc_free_page (void *page)
   palloc_free_multiple (page, 1);
 }
 
+/** Returns the number of availabe pages in user pool, and its base 
+    address, for mm.c to build its frame allocator upon. */
+size_t 
+palloc_userpool_size (void)
+  {
+    return user_pool_size;
+  }
+
+void *
+palloc_userpool_base (void)
+  {
+    return user_pool.base;
+  }
+
+/** Prints status of user pool, for debugging. */
+void
+palloc_userpool_check (void)
+{
+  printf ("userpool check (size = %lu):\n", user_pool_size);
+  bitmap_dump (user_pool.used_map);
+}
+
 /** Initializes pool P as starting at START and ending at END,
    naming it NAME for debugging purposes. */
 static void
@@ -162,9 +185,12 @@ init_pool (struct pool *p, void *base, size_t page_cnt, const char *name)
   page_cnt -= bm_pages;
 
   printf ("%zu pages available in %s.\n", page_cnt, name);
+  if (p == &user_pool)
+    user_pool_size = page_cnt;
 
   /* Initialize the pool. */
   lock_init (&p->lock);
+  memset (base, 0, bm_pages * PGSIZE);
   p->used_map = bitmap_create_in_buf (page_cnt, base, bm_pages * PGSIZE);
   p->base = base + bm_pages * PGSIZE;
 }

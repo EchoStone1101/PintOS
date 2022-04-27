@@ -2,8 +2,19 @@
 #define FILESYS_FILE_H
 
 #include "filesys/off_t.h"
+#include <debug.h>
+#include "filesys/inode.h"
+#include "threads/malloc.h"
 
 struct inode;
+
+/** An open file. */
+struct file 
+  {
+    struct inode *inode;        /**< File's inode. */
+    off_t pos;                  /**< Current position. */
+    bool deny_write;            /**< Has file_deny_write() been called? */
+  };
 
 /** Opening and closing files. */
 struct file *file_open (struct inode *);
@@ -20,6 +31,7 @@ off_t file_write_at (struct file *, const void *, off_t size, off_t start);
 /** Preventing writes. */
 void file_deny_write (struct file *);
 void file_allow_write (struct file *);
+bool file_is_deny_write (struct file *);
 
 /** File position. */
 void file_seek (struct file *, off_t);

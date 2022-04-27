@@ -9,6 +9,9 @@
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
+#ifdef VM
+#include "vm/mm.h"
+#endif
 
 /** States in a thread's life cycle. */
 enum thread_status
@@ -127,7 +130,14 @@ struct thread
     struct proc_stat_slot *pss;         /**< Process status slot of current process. */
 
     struct fd_table *fdt;               /**< Opened file descriptor table. */
-    void *file_self;                    /**< File that the process is loaded from. */
+    struct file *file_self;             /**< File that the process is loaded from. */
+#endif
+
+#ifdef VM
+   /* For virtual memory management. */
+   struct list vma_list;                /**< List of VMAs for user memory. */     
+   bool want_pinned;                    /**< Telling PF handler whether to pin the frame. */
+   void *esp;
 #endif
 
     /* Owned by thread.c. */

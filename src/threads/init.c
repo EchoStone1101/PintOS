@@ -31,6 +31,12 @@
 #else
 #include "tests/threads/tests.h"
 #endif
+#ifdef VM
+#include "vm/mm.h"
+#include "vm/frame.h"
+#include "vm/swap.h"
+// #define VM_CHECK
+#endif
 #ifdef FILESYS
 #include "devices/block.h"
 #include "devices/ide.h"
@@ -99,7 +105,6 @@ pintos_init (void)
   palloc_init (user_page_limit);
   malloc_init ();
   paging_init ();
-
  
 #ifdef USERPROG
   /* Segmentation. */
@@ -128,6 +133,10 @@ pintos_init (void)
   ide_init ();
   locate_block_devices ();
   filesys_init (format_filesys);
+#endif
+
+#ifdef VM
+  mm_init ();
 #endif
 
   printf ("Boot complete.\n");
@@ -463,10 +472,17 @@ static void
 run_task (char **argv)
 {
   const char *task = argv[1];
-  
   printf ("Executing '%s':\n", task);
+
 #ifdef USERPROG
   process_wait (process_execute (task));
+/* Sanity check to see if all frames and swap slots are freed. */
+#ifdef VM_CHECK
+  timer_sleep (100);
+  palloc_userpool_check ();
+  swap_check ();
+#endif
+
 #else
   run_test (task);
 #endif

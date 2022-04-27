@@ -5,6 +5,18 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/malloc.h"
+#include "threads/vaddr.h"
+#include <string.h>
+#ifdef VM
+#include "vm/mm.h"
+#include "vm/frame.h"
+#include "vm/mapfile.h"
+#include "vm/swap.h"
+
+extern struct lock frame_table_lock;
+
+#endif
 
 /** Number of page faults processed. */
 static long long page_fault_cnt;
@@ -155,8 +167,12 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
 
-  
-  /* For kernel page faults during a syscall, we want to send error
+	struct thread *cur = thread_current ();
+
+/* Without VM, only handle the special case where syscall handler
+   PF. User processes are always killed when PF. */
+#ifndef VM
+	/* For kernel page faults during a syscall, we want to send error
      code back to the faulting access, which is done in tandem with
      get_user() and put_user() calls. 
 
@@ -164,28 +180,223 @@ page_fault (struct intr_frame *f)
      after the faulting instruction, so that we set f->eip to it
      in order to skip the faulting access. We also set f->eax to
      be -1 as error code. */
-  if (thread_current ()->syscall && !user) 
-   {
+	if (cur->syscall && !user) 
+  	{
       f->eip = (void (*) (void)) f->eax;
       f->eax = -1;
       return;
-   }
-  else
-   {
-      /* Otherwise, current behavior is always killing the faulting
-         thread. If the fault comes from kernel code, kill() will
-         panic. */
-       kill (f);
-       
-      /* To implement virtual memory, delete the rest of the function
-         body, and replace it with code that brings in the page to
-         which fault_addr refers. */
-      printf ("Page fault at %p: %s error %s page in %s context.\n",
-               fault_addr,
-               not_present ? "not present" : "rights violation",
-               write ? "writing" : "reading",
-               user ? "user" : "kernel");
-   }
-      
+  	}
+  /* If the fault comes from kernel code, kill() will panic. */
+  kill (f);
+  printf ("Page fault at %p: %s error %s page in %s context.\n",
+          fault_addr,
+          not_present ? "not present" : "rights violation",
+          write ? "writing" : "reading",
+          user ? "user" : "kernel");
+
+/* With VM, kernel PF still PANIC (given it's not from syscall handler). 
+	User PF, on the other hand is more involved. */ 
+#else 
+	/* Kernel threads should never cause PF. */
+	if (cur->pagedir == NULL)
+		{
+			kill (f);
+			goto done;
+		}
+
+	if (fault_addr >= PHYS_BASE)
+		goto bad_access;
+
+	/* If PF happens at user access, read ESP from interrupt frame; otherwise, 
+	   cur->esp is set by syscall handler at entrance. */
+	if (user)
+		cur->esp = f->esp;
+
+	/* First, locate relevant VMA. */
+	struct list_elem *e;
+	struct vm_area *vma = NULL;
+  for (e = list_begin (&cur->vma_list); e != list_end (&cur->vma_list);
+       e = list_next (e))
+		{
+			vma = list_entry (e, struct vm_area, proc_elem);
+			if (vma->upper_bound > fault_addr)
+				{
+					if (vma->lower_bound > fault_addr)
+						/* Access to unmapped area. 
+							 Stack growth should happen here. */
+						goto bad_access;
+					else
+						break;
+				}
+		}
+	if (vma == NULL)
+		goto bad_access;
+	bool is_stack = (list_next (&vma->proc_elem) == list_end (&cur->vma_list));
+
+	/* Then check for permission. Note that NOT_PRESENT is not 
+	   reliable here, as frame_evict() can interleave and page out
+		 this frame, so we double check down below. */
+	if (!not_present) 
+		{
+			lock_acquire (&frame_table_lock);
+			void *from_page = pg_round_down (pagedir_get_page (cur->pagedir, fault_addr));
+			if (from_page == NULL)
+				{
+					lock_release (&frame_table_lock);
+					goto done;
+				}
+			else
+				{
+					if (!frame_set_pinned (phys_to_frame (from_page)))
+						{
+							lock_release (&frame_table_lock);
+							goto done;
+						}
+					lock_release (&frame_table_lock);
+				}
+
+			/* PF must be caused by writing a read-only page. */
+			if ((vma->flags & MAP_PRIVATE) && (vma->flags & MAP_WRITE))
+				{
+					/* COW happens here. */
+					void *to_page = anon_get_page (vma, vma->offset + (pg_round_down (fault_addr) 
+																													- vma->lower_bound));
+					if (to_page == NULL)
+						goto done;
+					
+					memcpy (to_page, from_page, PGSIZE);
+
+					/* Set the PTE in current process to the new frame, 
+					   marking it writable. 
+             The PTE must be cleared first, to flush the TLB! */
+					pagedir_clear_page (cur->pagedir, pg_round_down (fault_addr), 
+															0, AVL_INVALID);
+          pagedir_set_page (cur->pagedir, pg_round_down (fault_addr), 
+							 							to_page, true);
+					pagedir_set_accessed (cur->pagedir, fault_addr, true);
+					frame_clear_pinned (phys_to_frame (from_page));
+					frame_clear_busy (phys_to_frame (to_page));
+#ifdef FRAME_DEBUG
+					printf ("%d COW on address %p, from frame %p, to frame %p\n", 
+									thread_tid(), fault_addr, from_page, to_page);
+#endif
+					goto done;
+				}
+			/* Else, it's permission violation. */
+			frame_clear_pinned (phys_to_frame (from_page));
+			goto bad_access;
+		}
+
+	/* Now, must be fetching a non-resident page. */
+	int how = pagedir_get_avl (cur->pagedir, fault_addr);
+	int aux = pagedir_get_aux (cur->pagedir, fault_addr);
+	void *page;
+	bool writable;
+	switch (how)
+		{
+		case AVL_INVALID: 
+			/* Should not happen. PANIC the kernel. */
+			PANIC ("%d PF handler: unsure how to fetch page %p", 
+							thread_tid(), fault_addr);
+
+		case AVL_INFILE:
+			/* Find in backing file. */
+			ASSERT (vma_is_filebacked (vma));
+			page = mapfile_get_page (vma->mapfile, 
+						 vma->offset + (pg_round_down (fault_addr) - vma->lower_bound),
+						 aux, fault_addr);
+			if (page == NULL)
+				goto done;
+			writable = pagedir_is_writable (cur->pagedir, fault_addr);
+			pagedir_set_page (cur->pagedir, pg_round_down (fault_addr), 
+							 					page, writable);
+			pagedir_set_accessed (cur->pagedir, fault_addr, true);
+			frame_clear_busy (phys_to_frame (page));
+#ifdef FRAME_DEBUG
+			printf ("%d Fetch from FILE on address %p, to frame %p\n", 
+              thread_tid(), fault_addr, page);
+#endif
+			break;
+		
+		case AVL_INSWAP:
+			/* Find in swap. */
+			page = swap_get_page (vma, 
+						 vma->offset + (pg_round_down (fault_addr) - vma->lower_bound),
+						 aux);
+			if (page == NULL)
+				goto done;
+			writable = pagedir_is_writable (cur->pagedir, fault_addr);
+			pagedir_set_page (cur->pagedir, pg_round_down (fault_addr), 
+							 					page, writable);
+			pagedir_set_accessed (cur->pagedir, fault_addr, true);
+			frame_clear_busy (phys_to_frame (page));
+#ifdef FRAME_DEBUG
+			printf ("%d Fetch from SWAP(%d) on address %p, to frame %p\n", 
+              thread_tid(), aux, fault_addr, page);
+#endif
+			break;
+		
+		case AVL_ZEROED:
+			/* The stack growth heuristic is implemented here. */
+			if (is_stack)
+				{
+					ASSERT (cur->esp != NULL);
+					/* Only allow for normal accesses, push and pusha instructions. */
+					if (!(fault_addr >= cur->esp || fault_addr == cur->esp - 4 ||
+					    	fault_addr == cur->esp - 32))
+						goto bad_access;
+				}
+
+			/* Page should be zeroed. */
+			page = anon_get_page (vma, vma->offset + (pg_round_down (fault_addr) 
+																						 - vma->lower_bound));
+			if (page == NULL)
+				goto done;
+			memset (page, 0, PGSIZE);
+
+			writable = pagedir_is_writable (cur->pagedir, fault_addr);
+			pagedir_set_page (cur->pagedir, pg_round_down (fault_addr), 
+							 					page, writable);
+			pagedir_set_accessed (cur->pagedir, fault_addr, true);
+			frame_clear_busy (phys_to_frame (page));
+#ifdef FRAME_DEBUG
+			printf ("%d Zeroed page on address 0x%p, to frame %p\n", 
+              thread_tid(), fault_addr, page);
+#endif
+			break;
+		
+		default:
+			/* Should not happen. PANIC the kernel. */
+			PANIC ("%d PF handler: AVL field corrupted", thread_tid());
+		}
+
+	done:
+	/* Restart the same faulting instruction. 
+		 Might PF immediately again, if COW, or this PF cannot fetch the
+		 page right away. */
+	return;
+
+	bad_access:
+	if (cur->syscall && !user) 
+  	{
+			/* If from syscall handler, set the error code as -1, 
+	   		 when access is invalid (not in VMA; permission violation). */
+      f->eip = (void (*) (void)) f->eax;
+			f->eax = -1;
+			return;
+		}
+	else
+		{
+			/* Otherwise, just kill the faulting thread. */
+			printf ("Page fault at %p: %s error %s page in %s context.\n",
+          		fault_addr,
+          		not_present ? "not present" : "rights violation",
+          		write ? "writing" : "reading",
+          		user ? "user" : "kernel");
+			kill (f);
+			return;
+		}
+	
+#endif   
 }
 

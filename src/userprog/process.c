@@ -21,6 +21,14 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "threads/synch.h"
+#ifdef VM
+#include "vm/mm.h"
+#include "vm/mapfile.h"
+#include "vm/frame.h"
+#include "vm/swap.h"
+
+extern struct lock frame_table_lock;
+#endif
 
 //#define PSS_DEBUG
 
@@ -104,6 +112,7 @@ start_process (void *file_name_)
 {
   struct proc_start_page *page = file_name_;
   struct intr_frame if_;
+  struct thread *t = thread_current ();
   bool success;
 
   /* Initialize interrupt frame and load executable. */
@@ -123,7 +132,17 @@ start_process (void *file_name_)
      from the intr_frame correctly jumps to the USER STACK. */
   if (success)
     {
+#ifdef VM
+      /* With VM, the stack growth heuristic can fail, because the ESP of
+         this process is not initialized until load_arguments() returns. 
+         We temporarily set it to the lowest possible value to let PF during
+         load_arguments() be properly handled. */
+      t->esp = PHYS_BASE - STACK_PG_CNT * PGSIZE;
+#endif
       if_.esp = load_arguments (&page->tok);
+#ifdef VM
+      t->esp = NULL;
+#endif
       
       /* Notify parent about loading result. 
          This must happen after load_arguments(). This synchronization bug
@@ -133,7 +152,6 @@ start_process (void *file_name_)
   else
     {
       sema_up (&page->loaded);
-      struct thread *t = thread_current ();
       ASSERT (t->pss != NULL);
       t->pss->status = -1;
       thread_exit ();  
@@ -214,6 +232,105 @@ process_exit (void)
   if (pss != NULL)
     status = pss->status;
 
+
+  /* Destroy the current process's page directory and switch back
+     to the kernel-only page directory. */
+  pd = cur->pagedir;
+  if (pd != NULL) 
+    { 
+      /* Which means current thread is also a user process.
+         Print termination message. */
+      printf ("%s: exit(%d)\n", cur->name, status);
+/* Without VM, just free all the user pages in page table. */
+#ifndef VM
+
+      /* Correct ordering here is crucial.  We must set
+         cur->pagedir to NULL before switching page directories,
+         so that a timer interrupt can't switch back to the
+         process page directory.  We must activate the base page
+         directory before destroying the process's page
+         directory, or our active page directory will be one
+         that's been freed (and cleared). */
+      cur->pagedir = NULL;
+      pagedir_activate (NULL);
+      pagedir_destroy (pd);
+
+/* With VM, must instead 
+   (a) Scan all the pages made valid by VMAs, and check them in page table.
+       They might: 
+       - Be present. If dirty, and VMA is file-backed, with writable MAP_FILE,
+         (i.e. VMA is MAP_SHARED | MAP_WRITE), set frame to be FRAME_OP_WRITE.
+         Besides, if frame is anonymous, must also free them here, by setting
+         them to be FRAME_OP_DISCARD.
+       - Be unpresent, with AVL_INFILE or AVL_ZEROED. No need to do anything.
+       - Be unpresent, with AVL_INSWAP. Must free the corresponding swap slots.
+   (b) Then call mapfile_remove_vma() to detach VMAs from MAP_FILE. If MAP_FILE
+       becomes orphaned, frames are atomatically freed.
+   (c) Finally free all VMAs. */
+#else
+      while (!list_empty (&cur->vma_list))
+        {
+          struct list_elem *e = list_pop_front (&cur->vma_list);
+          struct vm_area *vma = list_entry (e, struct vm_area, proc_elem);
+
+          /* Scan the mapped pages. */
+          lock_acquire (&frame_table_lock);
+          for (void *upage = vma->lower_bound; upage < vma->upper_bound;
+               upage += PGSIZE)
+            {
+              void * phys_addr = pagedir_get_page (cur->pagedir, upage);
+              if (phys_addr == NULL)
+                {
+                  /* Not present. */
+                  int avl_flag = pagedir_get_avl (cur->pagedir, upage);
+                  switch (avl_flag)
+                    {
+                    case AVL_INFILE:
+                    case AVL_ZEROED: break;
+                    case AVL_INSWAP:
+                      /* TODO: Reap the swap slot. */
+                      swap_free_slot (pagedir_get_aux (cur->pagedir, upage));
+                      break;
+                    case AVL_INVALID: 
+                    default: 
+                      PANIC ("process_exit: PTE with invalid AVL field at %p", upage);
+                    }
+                }
+              else 
+                {
+                  /* Present. */
+                  struct frame *f = phys_to_frame (phys_addr);
+                  ASSERT (!frame_is_empty (f));
+
+                  if (frame_is_filebacked (f) && pagedir_is_dirty (cur->pagedir, upage))
+                    frame_set_write (f);
+                  if (frame_is_anon (f))
+                    {
+                      frame_clear_write (f);
+                      frame_free (f, 0);
+                      /* Reacquire frame_table_lock. */
+                      lock_acquire (&frame_table_lock);
+                    }
+                }
+            }
+          lock_release (&frame_table_lock);
+          
+          /* Detach VMA. Freeing MAP_FILE and frames (possibly writting
+             back) is done automatically. */
+          if (vma_is_filebacked (vma))
+            mapfile_remove_vma (vma->mapfile, vma);
+          
+          /* Finally, free VMA. */
+          free (vma);
+        }
+
+      cur->pagedir = NULL;
+      pagedir_activate (NULL);
+
+#endif
+    }
+  
+  /* Up PSS semaphore now, after this process has freed its frames. */
   do {
     /* The initial thread did not allocate a PSS, so don't
        free it. */
@@ -272,27 +389,6 @@ process_exit (void)
     }
 
   lock_release (&filesys_lock);
-
-  /* Destroy the current process's page directory and switch back
-     to the kernel-only page directory. */
-  pd = cur->pagedir;
-  if (pd != NULL) 
-    {
-      /* Which means current thread is also a user process.
-         Print termination message. */
-      printf ("%s: exit(%d)\n", cur->name, status);
-
-      /* Correct ordering here is crucial.  We must set
-         cur->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
-      cur->pagedir = NULL;
-      pagedir_activate (NULL);
-      pagedir_destroy (pd);
-    }
 }
 
 /** Sets up the CPU for running user code in the current
@@ -397,6 +493,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
+    /* Must not goto done here. */
     return success;
   process_activate ();
 
@@ -404,9 +501,22 @@ load (const char *file_name, void (**eip) (void), void **esp)
   lock_acquire (&filesys_lock);
 
   t->file_self = file = filesys_open (file_name);
-  /* Deny writes to executable. */
+
+  /* Deny writes to executable. 
+     However, if the executable file is already MMAPed (as MAP_WRITE),
+     loading should fail. */
   if (file != NULL)
-    file_deny_write (file);
+    {
+#ifdef VM
+      struct map_file *existing = mapfile_get_by_file (file);
+      if (existing != NULL && existing->writable)
+        {
+          printf ("load: %s: failed to load mmap-ed file\n", file_name);
+          goto done; 
+        }
+#endif
+      file_deny_write (file);
+    }
   else
     {
       printf ("load: %s: open failed\n", file_name);
@@ -475,9 +585,43 @@ load (const char *file_name, void (**eip) (void), void **esp)
                   read_bytes = 0;
                   zero_bytes = ROUND_UP (page_offset + phdr.p_memsz, PGSIZE);
                 }
+/* Without VM, immediately load. */
+#ifndef VM
               if (!load_segment (file, file_page, (void *) mem_page,
                                  read_bytes, zero_bytes, writable))
                 goto done;
+
+/* With VM, first create VMAs here using segment information, then call 
+  load_segment() (modified) to set PTEs. */
+#else
+              /* Create one VMA for one segment. */
+              struct vm_area *vma = malloc (sizeof (struct vm_area));
+              if (vma == NULL)
+                /* Allocation fails. The new process should exit, where 
+                   existing resources are freed in process_exit(). */
+                goto done;
+              
+              vma->lower_bound = (void *)mem_page;
+              vma->upper_bound = (void *)mem_page + read_bytes + zero_bytes;
+              vma->proc = t;
+              /* An executable is always loaded as PRIVATE. */
+              vma->flags = MAP_PRIVATE | (writable ? MAP_WRITE : MAP_READ);
+              vma->offset = file_page;
+              vma->filesize = read_bytes;
+              /* This interface safely attach VMA to a MAP_FILE instance. */
+              if (!mapfile_add_vma (file, vma, false))
+                {
+                  free (vma);
+                  goto done;
+                }
+              /* Segment successfully loaded. */
+              list_push_back (&t->vma_list, &vma->proc_elem);
+
+              /* Modified to set up PTEs. */
+              if (!load_segment (file, file_page, (void *) mem_page,
+                                 read_bytes, zero_bytes, writable))
+                goto done;
+#endif        
             }
           else
             goto done;
@@ -488,7 +632,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   /* Set up stack. */
   if (!setup_stack (esp))
     goto done;
-
+    
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
@@ -496,7 +640,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  
+
   /* For denying writes to executables, the process file must keep 
      opened, and gets closed when it finishes running. */
   if(!success)
@@ -560,6 +704,7 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
   return true;
 }
 
+
 /** Loads a segment starting at offset OFS in FILE at address
    UPAGE.  In total, READ_BYTES + ZERO_BYTES bytes of virtual
    memory are initialized, as follows:
@@ -591,6 +736,8 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
+/* Without VM, claim pages immediately, and fill them by reading/zeroing. */
+#ifndef VM
       /* Get a page of memory. */
       uint8_t *kpage = palloc_get_page (PAL_USER);
       if (kpage == NULL)
@@ -604,13 +751,29 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
         }
       memset (kpage + page_read_bytes, 0, page_zero_bytes);
 
-      /* Add the page to the process's address space. */
+       /* Add the page to the process's address space. */
       if (!install_page (upage, kpage, writable)) 
         {
           palloc_free_page (kpage);
           return false; 
         }
 
+/* With VM, set PTEs. */
+#else 
+      struct thread *t = thread_current ();
+      /* WRITABLE set to false, to ensure COW later.
+         If page_read_bytes is non-zero, AUX is set as page_read_bytes,
+         with AVL_FLAG as AVL_INFILE. Else, AUX is zeroed, with AVL_FLAG
+         set as AVL_ZEROED. */
+      if (!pagedir_set_page_lazy (t->pagedir, upage, 
+                                  /* If page_read_bytes non-zero, meant to be COW;
+                                     else, set according to WRITABLE. */
+                                  page_read_bytes > 0 ? false : writable, 
+                                  page_read_bytes,
+                                  page_read_bytes > 0 ? AVL_INFILE : AVL_ZEROED))
+        return false;
+
+#endif
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
@@ -624,6 +787,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 static bool
 setup_stack (void **esp) 
 {
+#ifndef VM
   uint8_t *kpage;
   bool success = false;
 
@@ -637,6 +801,53 @@ setup_stack (void **esp)
         palloc_free_page (kpage);
     }
   return success;
+#else 
+  struct thread *t = thread_current ();
+  for (int i = 1;i <= STACK_PG_CNT; i++)
+    {
+      if (!pagedir_set_page_lazy (t->pagedir, ((uint8_t *) PHYS_BASE) - i * PGSIZE, true, 
+                                  0, AVL_ZEROED))
+      return false;
+    }
+  
+  struct vm_area *stack = malloc (sizeof (struct vm_area));
+  if (stack == NULL)
+    return false;
+  
+  stack->lower_bound = ((void *)PHYS_BASE) - STACK_PG_CNT * PGSIZE;
+  stack->upper_bound = (void *)PHYS_BASE;
+  stack->proc = t;
+  stack->flags = MAP_PRIVATE | MAP_WRITE;
+  stack->offset = -(STACK_PG_CNT-1) * PGSIZE;
+  /* With stack growth, both OFFSET and LOWER_BOUND are decreased, so 
+     that code concerning offset remains valid. */
+  stack->filesize = 0;
+  /* stack is anonymous VMA, with no MAP_FILE attached. */
+  stack->mapfile = NULL;
+  list_push_back (&t->vma_list, &stack->proc_elem);
+  *esp = PHYS_BASE;
+  return true;
+#endif
+}
+
+/** Adds a mapping from user virtual address UPAGE to kernel
+   virtual address KPAGE to the page table.
+   If WRITABLE is true, the user process may modify the page;
+   otherwise, it is read-only.
+   UPAGE must not already be mapped.
+   KPAGE should probably be a page obtained from the user pool
+   with palloc_get_page().
+   Returns true on success, false if UPAGE is already mapped or
+   if memory allocation fails. */
+static bool UNUSED
+install_page (void *upage, void *kpage, bool writable) 
+{
+  struct thread *t = thread_current ();
+
+  /* Verify that there's not already a page at that virtual
+     address, then map our page there. */
+  return (pagedir_get_page (t->pagedir, upage) == NULL
+          && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
 
 /** Load the process program arguments at the top of its stack. 
@@ -646,7 +857,10 @@ setup_stack (void **esp)
 static void *
 load_arguments (struct cmdline_tokens* tok)
 {
-  /* Loading starts at stack top. */
+  /* Loading starts at stack top. 
+     If VM is defined, this function should immediately PF, where the
+     handler recognizes it as legal access to stack, and then try to
+     allocate a frame. */
   uint32_t top = (uint32_t) PHYS_BASE;
 
   /* Load the actual strings */
@@ -686,24 +900,4 @@ load_arguments (struct cmdline_tokens* tok)
   *(void **)top = NULL;
 
   return (void *) top;
-}
-
-/** Adds a mapping from user virtual address UPAGE to kernel
-   virtual address KPAGE to the page table.
-   If WRITABLE is true, the user process may modify the page;
-   otherwise, it is read-only.
-   UPAGE must not already be mapped.
-   KPAGE should probably be a page obtained from the user pool
-   with palloc_get_page().
-   Returns true on success, false if UPAGE is already mapped or
-   if memory allocation fails. */
-static bool
-install_page (void *upage, void *kpage, bool writable)
-{
-  struct thread *t = thread_current ();
-
-  /* Verify that there's not already a page at that virtual
-     address, then map our page there. */
-  return (pagedir_get_page (t->pagedir, upage) == NULL
-          && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }

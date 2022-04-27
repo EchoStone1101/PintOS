@@ -3,13 +3,6 @@
 #include "filesys/inode.h"
 #include "threads/malloc.h"
 
-/** An open file. */
-struct file 
-  {
-    struct inode *inode;        /**< File's inode. */
-    off_t pos;                  /**< Current position. */
-    bool deny_write;            /**< Has file_deny_write() been called? */
-  };
 
 /** Opens a file for the given INODE, of which it takes ownership,
    and returns the new file.  Returns a null pointer if an
@@ -138,6 +131,14 @@ file_allow_write (struct file *file)
       file->deny_write = false;
       inode_allow_write (file->inode);
     }
+}
+
+/** Returns whether FILE is set deny_write. */
+bool
+file_is_deny_write (struct file *file) 
+{
+  ASSERT (file != NULL);
+  return inode_is_deny_write (file->inode);
 }
 
 /** Returns the size of FILE in bytes. */
