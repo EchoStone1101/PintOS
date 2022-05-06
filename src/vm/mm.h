@@ -47,24 +47,23 @@
 
 
 /** The abstraction for a mapped area in a process. 
-    There can be multiple VM_AREAs for one process, chained by
-		its vma_list member in struct thread. Upon loading, one
-		VM_AREA is created for each segment. MMAP syscall also creates
-		new VM_AREA.
+    There can be multiple VM_AREAs for one process, chained by its 
+		vma_list member in struct thread. Upon loading, one VM_AREA is 
+		created for each segment. MMAP syscall also creates new VM_AREAs.
 		The VMA holds lower and upper bound for valid virtual addresses 
 		in the area. It also records type of the area: file-backed or
-		anonymous; in the formal case, VMA contains pointer to a MAP_FILE
+		anonymous; in the former case, VMA contains pointer to a MAP_FILE
 		struct and the offset into the backing file.
 		At page faults, the handler will first look into VMAs to see if
 		the address is valid (falls into one VMA). If so, the information
 		stored helps to fetch the non-present page. 
-		At page eviction, all relevant VMAs are also walked, crafting the 
+		At page eviction, all relevant VMAs are also walked, gathering the 
 		PTEs that reference the page, so that they can be invalidated. 
 		When the process exits, all its VMAs are freed. */
 struct vm_area
 	{
-		void *lower_bound;								/**< The lower bound of valid virtual address.*/
-		void *upper_bound;								/**< The upper bound of valid virtual address.*/
+		void *lower_bound;								/**< The lower bound of valid virtual address. */
+		void *upper_bound;								/**< The upper bound of valid virtual address. */
 		struct list_elem proc_elem;				/**< List element for owner process. */
 		struct thread *proc;		 					/**< Owner process of this VMA. */
 
@@ -79,10 +78,11 @@ struct vm_area
 	};
 
 
-/** Describes a unique memory mapped file.
-		For each different running executables and MMAPed files, exists 
+/** Describes a unique memory mapped file (called address_space in
+		Linux).
+		For each different running executable and MMAPed file, exists 
 		one MAP_FILE. Whenever a new process is loaded or a new file is
-		MMAPED, a hash table containing existing MAP_FILEs is searched
+		MMAPed, a hash table containing existing MAP_FILEs is searched
 		to see if an instance for that file already exists. If so, relevant
 		VMA points to the existing MAP_FILE.
 
@@ -94,9 +94,9 @@ struct vm_area
 		
 		A MAP_FILE importantly contains two one-to-many mappings: a list of 
 		VMAs that points to it, and a hash table of frames for data pages in
-		the file that currently occupies physical memory. Without MAP_FILE as
-		intermediate, the logical many-to-many mapping from VMAs to frames is
-		hard to implement. */
+		the file that are currently resident in physical memory. Without 
+		MAP_FILE as an intermediate, the logical many-to-many mapping from 
+		VMAs to frames is hard to implement without space overhead. */
 struct map_file
 	{
 		struct file *backing_file;		/**< The backing file pointer. */
@@ -108,7 +108,7 @@ struct map_file
 		struct hash_elem elem;				/**< Hash element for global pool of MAP_FILEs. */
 		void *inode;									/**< Inode pointer for backing file. */
 
-		struct list vma_list;					/**< The list of VMAs that points to this struct. */
+		struct list vma_list;					/**< The list of VMAs that point to this struct. */
 		struct hash page_pool;				/**< Contains all data pages from the file that are 
 																			 currently in memory. */
 
@@ -120,7 +120,10 @@ struct map_file
 /** Describes a physical frame in memory. 
     One such struct exists for EVERY frames available in user memory pool.
 		In Pintos default settings, that is 367 frames. It is obviously crucial
-		that this struct is as small as possible. 
+		that this struct is as small as possible, and we manage to compress it
+		to 16 bytes: 8 bytes for hash_elem, 4 bytes for a pointer to MAP_FILE
+		or VM_AREA, and 4 bytes for offset packed with flags. We believe these
+		are the bare minimum required.
 		
 		A non-empty frame either holds a file-backed page, or an anonymous page.
 		Here, a frame holding anonymous data can point directly to ONE VMA, 

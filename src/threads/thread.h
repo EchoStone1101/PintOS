@@ -137,7 +137,7 @@ struct thread
    /* For virtual memory management. */
    struct list vma_list;                /**< List of VMAs for user memory. */     
    bool want_pinned;                    /**< Telling PF handler whether to pin the frame. */
-   void *esp;
+   void *esp;                           /**< For PF handler to obtain user ESP. */
 #endif
 
     /* Owned by thread.c. */

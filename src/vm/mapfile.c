@@ -22,8 +22,9 @@ extern struct lock mapfile_pool_lock;
 
 /** Get existing MAP_FILE instance by BACKING_FILE. NULL is returned,
     if no such instance exists.
-		Used by load() in process.c to avoid loading an executable that
-		is already MMAPed as writable. */
+		Used by load() in process.c and syscall_mmap() in syscall.c to avoid 
+		loading an executable that is already MMAPed as writable, or the other
+		way around. */
 struct map_file *
 mapfile_get_by_file (struct file *backing_file)
 {
@@ -161,26 +162,25 @@ mapfile_remove_vma (struct map_file *mapfile, struct vm_area *vma)
 				 Grabbing page_pool_lock here can cause a DEADLOCK. */
 				
 			struct hash_iterator it;
-			
-			lock_acquire (&frame_table_lock);
-      while (!hash_empty (&mapfile->page_pool))
+			hash_first (&it, &mapfile->page_pool);
+
+      while (hash_next (&it))
       	{
-					hash_first (&it, &mapfile->page_pool);
-					struct hash_elem *h = hash_next (&it);
+					lock_acquire (&frame_table_lock);
+					struct hash_elem *h = hash_cur (&it);
         	struct frame *f = hash_entry (h, struct frame, elem);
-					hash_delete (&mapfile->page_pool, h);
 
 					int remaining = (int)(vma->filesize - frame_offset (f));
 					int read_bytes = remaining > PGSIZE ? PGSIZE : remaining;
+					
          	frame_free (f, read_bytes);
 					/* frame_table_lock atomatically released. */
-					lock_acquire (&frame_table_lock);
       	}
-			lock_release (&frame_table_lock);
 				
 			lock_acquire (&filesys_lock);
 			file_close (mapfile->backing_file);
 			lock_release (&filesys_lock);
+
 			free (mapfile);
 		}
 	else
@@ -193,12 +193,13 @@ mapfile_remove_vma (struct map_file *mapfile, struct vm_area *vma)
 /** Fetch the physical address of the page described by MAP_FILE, OFFSET, 
     and READ_BYTES.
   
-		Invoked by PF handler to retrieve the PA to fill the faulting PTE.
+		Invoked by PF handler to retrieve the frame to fill the faulting PTE.
 		Either the page is already in memory (shared, so PTEs can be out of sync),
 		and just locate it using page_pool; or that page must be fetched from 
 		the backing file.
-		For the latter case, paging-in may cause page eviction. This function
-		also blocks for paging-in.
+		For the latter case, a new frame is occupied, and returned as BUSY, so
+		that eviction ignores it, until caller finishes subsequent handling
+		(setting PTEs), and clears the BUSY bit.
 		
 		NULL could be returned, if page eviction fails, where the PF cannot be 
 		resolved at once. Luckily this should be rare with decent memory and 
@@ -213,7 +214,7 @@ mapfile_get_page (struct map_file *mapfile, off_t offset, size_t read_bytes,
 	struct frame query =
 		{
 			mapfile: 0,
-			offset: offset, 
+			offset: offset, // offset is enough for querying
 			elem: {{NULL, NULL}},
 		};
 
@@ -275,9 +276,7 @@ mapfile_get_page (struct map_file *mapfile, off_t offset, size_t read_bytes,
 					/* Not until here could frame_evict() find this frame not empty. But
 					   it is still BUSY, and not possibly evicted. */
 					if (thread_current ()->want_pinned)
-						{
-							frame_set_pinned (f);
-						}
+						frame_set_pinned (f);
 					frame_set_mapfile (f, mapfile);
 					frame_set_offset (f, offset);
 					frame_clear_write (f);
@@ -290,7 +289,7 @@ mapfile_get_page (struct map_file *mapfile, off_t offset, size_t read_bytes,
 					   This is because for executables, segments can be broken up in
 						 middle of a page. If the rest bytes are zeroed, access to the 
 						 second segment sees zeros instead of actual data. Try the
-						 userprog/read-normal test. */
+						 userprog/read-normal test to this see in action. */
 					if (offset + PGSIZE <= mapfile->file_end)
 						read_bytes = PGSIZE;
 					
@@ -326,7 +325,8 @@ mapfile_get_page (struct map_file *mapfile, off_t offset, size_t read_bytes,
 		time an anonymous page is accessed. Later, if evicted, the page should
 		be found in swap.
 
-		This function involves no I/O, but may cause page eviction.
+		This function involves no I/O, but may cause page eviction. The frame
+		returned is left as BUSY.
 		NULL could be returned, if page eviction fails, where the PF cannot be 
 		resolved at once. */
 void *
@@ -340,9 +340,7 @@ anon_get_page (struct vm_area *vma, off_t offset)
 		{
 			frame_set_busy (f);
 			if (thread_current ()->want_pinned)
-				{
-					frame_set_pinned (f);
-				}
+				frame_set_pinned (f);
 			/* Note that VMA may not actually be anonymous, like .bss pages sharing
 			   a VMA with .data pages. The former should always be paged in with
 				 anon_get_page() and swap_get_page(), and not registered into page_pool,

@@ -9,8 +9,6 @@
 #include "threads/thread.h"
 #include <stdio.h>
 
-extern struct lock frame_table_lock;
-
 /** Swap disk device. */
 struct block *swap_space;
 
@@ -64,18 +62,18 @@ swap_init (void)
         free (swap_table);
       if (swap_table_busy != NULL)
         free (swap_table_busy);
-      swap_size = 0;
       goto no_swap;
     }
   
-  /* Reserve slot 0, so that swap index 0 is always not allocated
-     for swapped pages. 
+  /* Reserve slot 0 (SWAP_SLOT_INVALID), so that swap index 0 is always 
+     not allocated for swapped pages. 
      Helps debugging; besides, that page might also be used to store 
      meta data on disk. */
   swap_table[0] = 1;
   return;
 
   no_swap:
+  swap_size = 0;
   swap_space = NULL;
   printf ("swap_init: warning - swap space unavailable\n");
 }
@@ -114,9 +112,9 @@ swap_reserve_slot (void)
 /** Free the slot SLOT_IDX in swap table. 
     The specified slot must not be already free. It can however be 
     BUSY, when frame_free() is halfway swapping a page that belongs
-    to a dying process, freeing its slots in swap. In that case, 
-    busy waits until it is no longer busy, to ensure data written
-    later to this slot is not corrupted. */
+    to a dying process, freeing its slots in swap. In that case, this
+    rountine busy waits until it is no longer BUSY, to ensure data 
+    written later to this slot is not corrupted. */
 void
 swap_free_slot (int slot_idx)
 {
@@ -136,7 +134,7 @@ swap_free_slot (int slot_idx)
     OFFSET, and return the physical address of allocated frame. Once swapping
     in is done, the slot is also freed.
     Invoked by PF handler to fill PTE with a frame that contains swapped in
-    data.
+    data. The frame is left as BUSY.
 
 		NULL could be returned, if page eviction fails, or the wanted page is BUSY
     (i.e. it is still halfway swapping out), where the PF cannot be resolved 
@@ -146,6 +144,7 @@ swap_get_page (struct vm_area *vma, off_t offset, int slot_idx)
 {
   ASSERT (slot_idx != SWAP_SLOT_INVALID && slot_idx < (int)swap_size);
 	ASSERT (vma != NULL);
+  /* Busy waits for BUSY slot. */
   if (swap_is_busy (slot_idx))
     return NULL;
 
@@ -154,17 +153,15 @@ swap_get_page (struct vm_area *vma, off_t offset, int slot_idx)
 	f = frame_alloc ();
 	if (f != NULL)
 		{
-			lock_acquire (&frame_table_lock);
+      frame_set_busy (f);
+      if (thread_current ()->want_pinned)
+        frame_set_pinned (f);
 			frame_set_anon_vma (f, vma);
 			frame_set_offset (f, offset);
 			frame_set_write (f);
-      frame_set_busy (f);
-      if (thread_current ()->want_pinned)
-				{
-					frame_set_pinned (f);
-				}
+      
       swap_set_busy (slot_idx);
-			lock_release (&frame_table_lock);	
+
       /* Start I/O to swap-in data. Synchronization is done within block_read. */
       
       void *phys_addr = frame_to_phys (f);

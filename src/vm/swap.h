@@ -27,8 +27,7 @@
 typedef uint32_t cluster_t;
 typedef uint32_t* bitmap_t;
 
-/** So that we can efficiently test if a cluster is full. */
-#define SECTOR_PER_PAGE (PGSIZE/BLOCK_SECTOR_SIZE)
+#define SECTOR_PER_PAGE (PGSIZE / BLOCK_SECTOR_SIZE)
 #define SWAP_CLUSTER_SIZE 32
 #define SWAP_SLOT_INVALID 0
 

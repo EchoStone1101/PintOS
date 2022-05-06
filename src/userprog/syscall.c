@@ -81,22 +81,30 @@ static const void * syscall_worker [] = {
 extern struct lock filesys_lock;
 
 #ifdef VM
-/** Unpin the user buffer spanning from UADDR for up to MAXLEN 
-    bytes. We expect consecutive frames starting from UADDR to
-    be present and PINNED. */
+/** Unpin the user buffer spanning from UADDR for up to MAXLEN bytes. 
+    This function is meant to be called in pair with check_user_XXX_buffer(),
+    which pins user buffer frames. We expect consecutive frames starting from 
+    UADDR to be both present and PINNED, until the first unpresent frame, or
+    '\0' is encountered if IS_STRING. */
 static void
 unpin_user_buffer (const char * uaddr, size_t maxlen, bool is_string)
 {
+  /* If UADDR is invalid or MAXLEN is zero, no actual pinning is done
+     hence no unpinning is needed. */
   bool early_stop = !(uaddr < (const char *)PHYS_BASE) || maxlen == 0;
+
   void *phys_addr;
   struct frame *f = NULL;
   struct thread *cur = thread_current ();
   ASSERT (cur->want_pinned == false);
+
   lock_acquire (&frame_table_lock);
   for (unsigned i = 0; !early_stop; i++)
     {
       if (i == 0 || (int32_t)(uaddr + i) % PGSIZE == 0)
         {
+          /* When new frame is encountered, check if it is 
+             present and pinned. */
           void *page = (void*)((int)(uaddr + i) & (~PGMASK));
           phys_addr = pagedir_get_page (cur->pagedir, page);
           if (phys_addr != NULL)
@@ -106,30 +114,29 @@ unpin_user_buffer (const char * uaddr, size_t maxlen, bool is_string)
             }
           else
             {
+              /* Unpresent, indicating end of pinned frames. */
               if (f != NULL)
-                {
-                  frame_clear_pinned (f);
-                }
+                frame_clear_pinned (f);
               lock_release (&frame_table_lock);
               return;
             }
         }
+      /* Early-stopping for IS_STRING. */
       if ((is_string && *(uaddr + i) == '\0') || i == maxlen - 1 || 
            (uaddr + i + 1) >= (const char *)PHYS_BASE)
         early_stop = true;
+      /* Unpin before entering next frame. */
       if (early_stop || (int32_t)(uaddr + i + 1) % PGSIZE == 0)
-        {
-          frame_clear_pinned (f);
-        }
+        frame_clear_pinned (f);
     }
   lock_release (&frame_table_lock);
 }
 #endif
 
-/* Reads a byte at user virtual address UADDR.
-   UADDR must be below PHYS_BASE.
-   Returns the byte value if successful, -1 if a segfault
-   occurred. */
+/** Reads a byte at user virtual address UADDR.
+    UADDR must be below PHYS_BASE.
+    Returns the byte value if successful, -1 if a page fault
+    occurred. */
 static int
 get_user (const uint8_t *uaddr) 
 {
@@ -139,11 +146,12 @@ get_user (const uint8_t *uaddr)
   return result;
 } 
 
-/* Reads a word at user virtual address UADDR, stored to DST.
-   Checks that the entire access is below PHYS_BASE, then invokes
-   get_user() to actually read. Useful in reading arguments from
-   user address space.
-   Returns false if access surpasses PHYS_BASE or segfault occurred. */
+/** Reads a word at user virtual address UADDR, stored to DST.
+    Checks that the entire access is below PHYS_BASE, then invokes
+    get_user() to actually read. Useful in reading arguments from
+    user address space.
+    Returns false if access surpasses PHYS_BASE or page fault 
+    occurred. */
 static bool
 get_user_word (const uint8_t *uaddr, int32_t *dst) 
 {
@@ -164,10 +172,13 @@ get_user_word (const uint8_t *uaddr, int32_t *dst)
   return true;
 }
 
-/* Checks for the validity of READABLE buffer starting from UADDR, spanning 
-   at most MAXLEN bytes. Lack of '\0' is tolerated, requiring subsequent 
-   operations to check for the length or terminate the string themselves.
-   Returns false if access surpasses PHYS_BASE or segfault occurred. */
+/** Checks for the validity of READABLE buffer starting from UADDR, spanning 
+    at most MAXLEN bytes. 
+    Lack of '\0' is tolerated, requiring subsequent operations to check for 
+    the length or terminate the string themselves. Returns false if access 
+    surpasses PHYS_BASE or page fault occurred. 
+    With VM, the specified buffer is also pinned, to avoid eviction during
+    later access. Invoke unpin_user_buffer() later to properly unpin it. */
 static bool
 check_user_read_buffer (const char * uaddr, size_t maxlen, bool is_string) 
 {
@@ -180,12 +191,11 @@ check_user_read_buffer (const char * uaddr, size_t maxlen, bool is_string)
     {
       int ch;
 
-/* With VM, must also PIN the user buffer, if valid, so that it is not
-   evicted during later I/O by syscall workers. 
-   For every UADDR that is page-aligned, by holding frame_table_lock, PTE
-   can be examined without racing. If it is present, FRAME can be directly
-   located and PINNED. Otherwise, later access causes PF, where we make the
-   handler PIN the frame after paging-in. */
+/* Pin the user buffer. For every UADDR that is page-aligned, by holding 
+   frame_table_lock, PTE can be examined without racing. If it is present, 
+   the frame can be directly located and PINNED. Otherwise, later access 
+   causes PF, where we make the handler PIN the frame by setting 
+   cur->want_pinned. */
 #ifdef VM 
       if ((i == 0 || (int32_t)(uaddr + i) % PGSIZE == 0)
           && uaddr + i < (const char *)PHYS_BASE)
@@ -194,6 +204,9 @@ check_user_read_buffer (const char * uaddr, size_t maxlen, bool is_string)
           void *page = (void*)((int)(uaddr + i) & (~PGMASK));
           void *phys_addr;
           retry:
+          /* Re-examine if PTE is valid, for, though unlikely, the 
+             frame can be completely unpined and evicted during 
+             sleeping. */
           phys_addr = pagedir_get_page (cur->pagedir, page);
           if (phys_addr != NULL)
             {
@@ -231,9 +244,9 @@ check_user_read_buffer (const char * uaddr, size_t maxlen, bool is_string)
   return true;
 }
 
-/* Writes BYTE to user address UDST.
-   UDST must be below PHYS_BASE.
-   Returns true if successful, false if a segfault occurred. */
+/** Writes BYTE to user address UDST.
+    UDST must be below PHYS_BASE.
+    Returns true if successful, false if a segfault occurred. */
 static bool
 put_user (uint8_t *udst, uint8_t byte) 
 {
@@ -243,9 +256,10 @@ put_user (uint8_t *udst, uint8_t byte)
   return error_code != -1;
 }
 
-/* Checks for the validity of WRITABLE buffer starting from UADDR, spanning 
-   at most MAXLEN bytes. 
-   Returns false if access surpasses PHYS_BASE or segfault occurred. */
+/** Checks for the validity of WRITABLE buffer starting from UADDR, spanning 
+    at most MAXLEN bytes. Returns false if access surpasses PHYS_BASE or page 
+    fault occurred. 
+    Also pins the buffer specified. */
 static bool
 check_user_write_buffer (const char * uaddr, size_t maxlen) 
 {
@@ -290,15 +304,14 @@ check_user_write_buffer (const char * uaddr, size_t maxlen)
           return false;
         }
     }
-
 #ifdef VM
   cur->want_pinned = false;
 #endif
   return true;
 }
 
-/* Checks for the validity of FD as an opened FD.
-   Returns true if valid, false if not. */
+/** Checks for the validity of FD as an opened FD.
+    Returns true if valid, false if not. */
 static bool
 fd_valid (int fd)
 {
@@ -317,8 +330,8 @@ fd_valid (int fd)
   return true;
 }
 
-/* Terminated current process for misconduct.
-   Set its return status to -1. */
+/** Terminated current process for misconduct.
+    Set its return status to -1. */
 static void
 syscall_terminate (void)
 {
@@ -339,14 +352,14 @@ syscall_init (void)
   lock_init (&filesys_lock);
 }
 
-/* The registered syscall handler. Reads the syscall number and
-   the arguments, and invoke corresponding fucntions to actually
-   do the work. */
+/** The registered syscall handler. Reads the syscall number and
+    the arguments, and invoke corresponding fucntions to actually
+    do the work. */
 static void
 syscall_handler (struct intr_frame *f) 
 {
-  /* Set syscall to true before any memory access to user memory. */
   struct thread *t = thread_current ();
+  /* Set syscall to true before any memory access to user memory. */
   t->syscall = true;
 #ifdef VM
   t->esp = f->esp;
@@ -402,7 +415,10 @@ syscall_handler (struct intr_frame *f)
 
   /* Set syscall back to false. */
   t->syscall = false;
+
 #ifdef VM
+  /* Reset t->esp, as a sanity check. If PF happens but t->esp is 
+     NULL, something went wrong. */
   t->esp = NULL;
 #endif
   return;
@@ -735,7 +751,7 @@ syscall_close (int fd)
 }
 
 /** Worker for MMAP.
-    Maps the file open as fd into the process's virtual address space, as 
+    Maps the file open as FD into the process's virtual address space, as 
     consecutive virtual pages starting at ADDR. 
     In Pintos, MMAP is not configurable by flags, and all MMAPs default
     to MAP_SHARED | MAP_WRITE. */
@@ -745,6 +761,7 @@ static mapid_t syscall_mmap (int fd, void *addr)
   syscall_terminate ();
   NOT_REACHED ();
 #endif
+
   struct thread *cur = thread_current ();
 
   /* Invalid FD in terms of MMAP.
@@ -761,7 +778,6 @@ static mapid_t syscall_mmap (int fd, void *addr)
   /* Fail if ADDR is NULL or not page-aligned. */
   if (((int)addr & PGMASK) != 0 || addr == NULL)
     goto bad_mmap;
-
 
   lock_acquire (&filesys_lock);
   size_t read_bytes = file_length (file);
@@ -791,7 +807,29 @@ static mapid_t syscall_mmap (int fd, void *addr)
   /* By now, we confirm the MMAP call is valid. It can still fail
      if kernel runs out of memory. */
 
-  /* Create VMA for this MMAPed area. */
+  /* First, set up PTEs. */
+  void *upage = addr;
+  size_t _read_bytes = read_bytes;
+  size_t _zero_bytes = zero_bytes;
+  while (_read_bytes > 0 || _zero_bytes > 0) 
+    {
+      size_t page_read_bytes = _read_bytes < PGSIZE ? _read_bytes : PGSIZE;
+      size_t page_zero_bytes = PGSIZE - page_read_bytes;
+
+      /* WRITABLE set to false, to ensure COW later.
+         If page_read_bytes is non-zero, AUX is set as page_read_bytes,
+         with AVL_FLAG as AVL_INFILE. Else, AUX is zeroed, with AVL_FLAG
+         set as AVL_ZEROED. */
+      if (!pagedir_set_page_lazy (cur->pagedir, upage, true,
+                                  page_read_bytes, AVL_INFILE))
+        goto bad_mmap;
+
+      _read_bytes -= page_read_bytes;
+      _zero_bytes -= page_zero_bytes;
+      upage += PGSIZE;
+    }
+
+  /* Then create VMA for this MMAPed area. */
   struct vm_area *vma = malloc (sizeof (struct vm_area));
   if (vma == NULL)
     goto bad_mmap;
@@ -816,26 +854,6 @@ static mapid_t syscall_mmap (int fd, void *addr)
   
   /* VMA successfully attached. */
   list_insert (e, &vma->proc_elem);
-
-  /* Finally, set up PTEs. */
-  void *upage = addr;
-  while (read_bytes > 0 || zero_bytes > 0) 
-    {
-      size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
-      size_t page_zero_bytes = PGSIZE - page_read_bytes;
-
-      /* WRITABLE set to false, to ensure COW later.
-         If page_read_bytes is non-zero, AUX is set as page_read_bytes,
-         with AVL_FLAG as AVL_INFILE. Else, AUX is zeroed, with AVL_FLAG
-         set as AVL_ZEROED. */
-      if (!pagedir_set_page_lazy (cur->pagedir, upage, true,
-                                  page_read_bytes, AVL_INFILE))
-        goto bad_mmap;
-
-      read_bytes -= page_read_bytes;
-      zero_bytes -= page_zero_bytes;
-      upage += PGSIZE;
-    }
   
   /* Successful MMAP. */
   return (mapid_t)vma;
@@ -853,6 +871,7 @@ static void syscall_munmap (mapid_t mapid)
   syscall_terminate ();
   NOT_REACHED ();
 #endif
+
   struct thread *cur = thread_current ();
   struct list_elem *e;
   struct vm_area *vma = NULL;
@@ -861,9 +880,10 @@ static void syscall_munmap (mapid_t mapid)
 		{
 			struct vm_area *_vma = list_entry (e, struct vm_area, proc_elem);
       /* We use the VMA->flags to distinguish between MMAPed VMAs and VMAs 
-         describing an executable segment. This works because Pintos MMAPs
-         has only one flags option, and can be improved by marking explicitly
-         the MMAPed VMAs. */
+         describing an executable segment. This is of course makeshift, but 
+         works because Pintos MMAPs has only one flags option. 
+         This check is necessary because if user manages to guess the address 
+         of VMA describing stack, the frames and swap slots can go unfreed. */
 			if ((mapid_t)_vma == mapid &&
           _vma->flags == (MAP_SHARED | MAP_WRITE))
         {
@@ -876,8 +896,7 @@ static void syscall_munmap (mapid_t mapid)
   if (vma == NULL)
     return;
 
-  
-  /* Scan the mapped pages. */
+  /* Scan the mapped pages, setting the WRITE bit of frames. */
   lock_acquire (&frame_table_lock);
   for (void *upage = vma->lower_bound; upage < vma->upper_bound;
        upage += PGSIZE)
@@ -885,7 +904,7 @@ static void syscall_munmap (mapid_t mapid)
       void * phys_addr = pagedir_get_page (cur->pagedir, upage);
       if (phys_addr != NULL)
         {
-          /* Present. */
+          pagedir_clear_page (cur->pagedir, upage, 0, AVL_INVALID);
           struct frame *f = phys_to_frame (phys_addr);
           ASSERT (!frame_is_empty (f) && frame_is_filebacked (f));
 
@@ -898,7 +917,7 @@ static void syscall_munmap (mapid_t mapid)
   /* By now, remove the VMA describing mapped area MAPID. */
   list_remove (&vma->proc_elem);
   mapfile_remove_vma (vma->mapfile, vma);
-  /* Dirty pages are writen back automatically within this call. */
+  /* Dirty pages are writen back automatically within this function. */
 
   free (vma);
 }

@@ -6,13 +6,13 @@
 #include "threads/vaddr.h"
 #include "filesys/file.h"
 
+/* Reserved file descriptors. */
 #define STDIN_FILENO 0
 #define STDOUT_FILENO 1
 
 /* User stack is limited to STACK_PG_CNT pages at most. */
 #define STACK_PG_CNT 128
 
-/* Not sure why this typedef is not captured by compiler. */
 typedef int tid_t;
 
 /* Process status slot. */

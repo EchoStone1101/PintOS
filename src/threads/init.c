@@ -35,6 +35,9 @@
 #include "vm/mm.h"
 #include "vm/frame.h"
 #include "vm/swap.h"
+
+/* Un-comment to print debug information about frame table and swap
+   after execution. */
 // #define VM_CHECK
 #endif
 #ifdef FILESYS
@@ -476,9 +479,10 @@ run_task (char **argv)
 
 #ifdef USERPROG
   process_wait (process_execute (task));
-/* Sanity check to see if all frames and swap slots are freed. */
+
 #ifdef VM_CHECK
-  timer_sleep (100);
+  /* Sanity check to see if all frames and swap slots are freed. */
+  timer_sleep (200);
   palloc_userpool_check ();
   swap_check ();
 #endif

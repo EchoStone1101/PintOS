@@ -195,7 +195,7 @@ page_fault (struct intr_frame *f)
           user ? "user" : "kernel");
 
 /* With VM, kernel PF still PANIC (given it's not from syscall handler). 
-	User PF, on the other hand is more involved. */ 
+	 User PF, on the other hand, is more involved. */ 
 #else 
 	/* Kernel threads should never cause PF. */
 	if (cur->pagedir == NULL)
@@ -222,8 +222,7 @@ page_fault (struct intr_frame *f)
 			if (vma->upper_bound > fault_addr)
 				{
 					if (vma->lower_bound > fault_addr)
-						/* Access to unmapped area. 
-							 Stack growth should happen here. */
+						/* Access to unmapped area. */
 						goto bad_access;
 					else
 						break;
@@ -231,6 +230,9 @@ page_fault (struct intr_frame *f)
 		}
 	if (vma == NULL)
 		goto bad_access;
+	
+	/* VMA_LIST is sorted by virtual address in increasing order, 
+		 so the last VMA is always stack. */
 	bool is_stack = (list_next (&vma->proc_elem) == list_end (&cur->vma_list));
 
 	/* Then check for permission. Note that NOT_PRESENT is not 
@@ -240,14 +242,18 @@ page_fault (struct intr_frame *f)
 		{
 			lock_acquire (&frame_table_lock);
 			void *from_page = pg_round_down (pagedir_get_page (cur->pagedir, fault_addr));
+			struct frame *from_frame = phys_to_frame (from_page);
 			if (from_page == NULL)
 				{
+					/* The frame is in fact evicted. Restart PF. */
 					lock_release (&frame_table_lock);
 					goto done;
 				}
 			else
 				{
-					if (!frame_set_pinned (phys_to_frame (from_page)))
+					/* ...or it remains resident. For COW purposes, temporarily
+					   PIN this frame. */
+					if (!frame_set_pinned (from_frame))
 						{
 							lock_release (&frame_table_lock);
 							goto done;
@@ -262,7 +268,10 @@ page_fault (struct intr_frame *f)
 					void *to_page = anon_get_page (vma, vma->offset + (pg_round_down (fault_addr) 
 																													- vma->lower_bound));
 					if (to_page == NULL)
-						goto done;
+						{
+							frame_clear_pinned (from_frame);
+							goto done;
+						}
 					
 					memcpy (to_page, from_page, PGSIZE);
 
@@ -274,7 +283,7 @@ page_fault (struct intr_frame *f)
           pagedir_set_page (cur->pagedir, pg_round_down (fault_addr), 
 							 							to_page, true);
 					pagedir_set_accessed (cur->pagedir, fault_addr, true);
-					frame_clear_pinned (phys_to_frame (from_page));
+					frame_clear_pinned (from_frame);
 					frame_clear_busy (phys_to_frame (to_page));
 #ifdef FRAME_DEBUG
 					printf ("%d COW on address %p, from frame %p, to frame %p\n", 
@@ -282,6 +291,7 @@ page_fault (struct intr_frame *f)
 #endif
 					goto done;
 				}
+				
 			/* Else, it's permission violation. */
 			frame_clear_pinned (phys_to_frame (from_page));
 			goto bad_access;

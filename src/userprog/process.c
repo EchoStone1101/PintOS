@@ -259,9 +259,8 @@ process_exit (void)
    (a) Scan all the pages made valid by VMAs, and check them in page table.
        They might: 
        - Be present. If dirty, and VMA is file-backed, with writable MAP_FILE,
-         (i.e. VMA is MAP_SHARED | MAP_WRITE), set frame to be FRAME_OP_WRITE.
-         Besides, if frame is anonymous, must also free them here, by setting
-         them to be FRAME_OP_DISCARD.
+         (i.e. VMA is MAP_SHARED | MAP_WRITE), set frame's WRITE bit. Besides, 
+         if frame is anonymous, must also free them here.
        - Be unpresent, with AVL_INFILE or AVL_ZEROED. No need to do anything.
        - Be unpresent, with AVL_INSWAP. Must free the corresponding swap slots.
    (b) Then call mapfile_remove_vma() to detach VMAs from MAP_FILE. If MAP_FILE
@@ -286,9 +285,9 @@ process_exit (void)
                   switch (avl_flag)
                     {
                     case AVL_INFILE:
-                    case AVL_ZEROED: break;
+                    case AVL_ZEROED: 
+                      break;
                     case AVL_INSWAP:
-                      /* TODO: Reap the swap slot. */
                       swap_free_slot (pagedir_get_aux (cur->pagedir, upage));
                       break;
                     case AVL_INVALID: 
@@ -299,6 +298,7 @@ process_exit (void)
               else 
                 {
                   /* Present. */
+                  pagedir_clear_page (cur->pagedir, upage, 0, AVL_INVALID);
                   struct frame *f = phys_to_frame (phys_addr);
                   ASSERT (!frame_is_empty (f));
 
@@ -308,7 +308,7 @@ process_exit (void)
                     {
                       frame_clear_write (f);
                       frame_free (f, 0);
-                      /* Reacquire frame_table_lock. */
+                      /* Re-acquire frame_table_lock. */
                       lock_acquire (&frame_table_lock);
                     }
                 }
@@ -326,7 +326,9 @@ process_exit (void)
 
       cur->pagedir = NULL;
       pagedir_activate (NULL);
-
+      /* Not to forget destorying the page directory, which frees all 
+         pages holding PTEs and PDEs. */
+      pagedir_destroy (pd);
 #endif
     }
   
@@ -591,9 +593,16 @@ load (const char *file_name, void (**eip) (void), void **esp)
                                  read_bytes, zero_bytes, writable))
                 goto done;
 
-/* With VM, first create VMAs here using segment information, then call 
-  load_segment() (modified) to set PTEs. */
+/* With VM, first call load_segment() (modified) to set PTEs, then create 
+   VMAs here using segment information. This order is important: if VMA is 
+   attached but load_segment fails, process_exit() will find PTEs that are
+   not properly initialized. */
 #else
+              /* Modified to set up PTEs. */
+              if (!load_segment (file, file_page, (void *) mem_page,
+                                 read_bytes, zero_bytes, writable))
+                goto done;
+
               /* Create one VMA for one segment. */
               struct vm_area *vma = malloc (sizeof (struct vm_area));
               if (vma == NULL)
@@ -617,10 +626,6 @@ load (const char *file_name, void (**eip) (void), void **esp)
               /* Segment successfully loaded. */
               list_push_back (&t->vma_list, &vma->proc_elem);
 
-              /* Modified to set up PTEs. */
-              if (!load_segment (file, file_page, (void *) mem_page,
-                                 read_bytes, zero_bytes, writable))
-                goto done;
 #endif        
             }
           else
@@ -819,8 +824,6 @@ setup_stack (void **esp)
   stack->proc = t;
   stack->flags = MAP_PRIVATE | MAP_WRITE;
   stack->offset = -(STACK_PG_CNT-1) * PGSIZE;
-  /* With stack growth, both OFFSET and LOWER_BOUND are decreased, so 
-     that code concerning offset remains valid. */
   stack->filesize = 0;
   /* stack is anonymous VMA, with no MAP_FILE attached. */
   stack->mapfile = NULL;

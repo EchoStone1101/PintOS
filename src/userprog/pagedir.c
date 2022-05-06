@@ -175,8 +175,8 @@ pagedir_get_page (uint32_t *pd, const void *uaddr)
 
 /** Marks user virtual page UPAGE "not present" in page
    directory PD.  Later accesses to the page will fault.  
-   The original PFN field [12:31] is set as AUX.
-   UPAGE need not be mapped. */
+   The original PFN field [12:31] is set as AUX, and AVL field set as
+   AVL_FLAG. UPAGE need not be mapped. */
 void
 pagedir_clear_page (uint32_t *pd, void *upage, int aux, int avl_flag) 
 {

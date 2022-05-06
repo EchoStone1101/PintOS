@@ -43,7 +43,7 @@
 #define FRAME_FLAG_MASK 				0xFFF
 
 /** PTE flags in AVL field, describing where to fetch the page. */
-#define AVL_INVALID     0x00000000		/**< Indicates a serious fault. */
+#define AVL_INVALID     0x00000000		/**< Field not properly set. */
 #define AVL_INFILE      0x00000200		/**< Fetch from file. */
 #define AVL_INSWAP      0x00000400 		/**< Fetch from swap. */
 #define AVL_ZEROED      0x00000600 		/**< Create a zeroed page. */
@@ -75,6 +75,7 @@
 #define frame_clear_busy(pFRAME) ((pFRAME)->flags &= (~FRAME_FLAG_BUSY))
 
 #define frame_pinned(pFRAME) ((pFRAME)->flags & FRAME_FLAG_PINNED)
+/* Also returns whether pinning is successful. */
 #define frame_set_pinned(pFRAME) (frame_pinned(pFRAME)<FRAME_FLAG_PINNED ?\
 																	((pFRAME)->flags = (pFRAME)->flags + 0x8) : 0)
 #define frame_clear_pinned(pFRAME) (frame_pinned(pFRAME) ? (pFRAME)->flags -= 0x8 : 0)
