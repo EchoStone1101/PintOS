@@ -460,12 +460,12 @@ frame_evict (size_t cnt, bool hard)
 			int aux = 0;
 			if (frame_is_filebacked (f))
 				{
+					int read_bytes = frame_get_read_bytes (f, &rm_list);
+					frame_invalidate (f, &rm_list, read_bytes, AVL_INFILE);
+
 					/* Call frame_dirty() to clear DIRTY bits anyway. */
 					if (frame_dirty (f, &rm_list, true))
 						frame_set_write (f);
-					
-					int read_bytes = frame_get_read_bytes (f, &rm_list);
-					frame_invalidate (f, &rm_list, read_bytes, AVL_INFILE);
 
 					struct map_file *mapfile = frame_mapfile (f);
 					hash_delete (&mapfile->page_pool, &f->elem);

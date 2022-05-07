@@ -79,7 +79,6 @@ mapfile_add_vma (struct file *backing_file, struct vm_area *vma, bool writable)
 	if (existing != NULL)
 		{
 			/* Found existing MAP_FILE instance. */
-			lock_release (&mapfile_pool_lock);
 			free (mapfile);
 
 			/* Must not load an executable that was MMAPed as a normal file, 
@@ -93,6 +92,7 @@ mapfile_add_vma (struct file *backing_file, struct vm_area *vma, bool writable)
 			lock_release (&existing->page_pool_lock);
 
 			vma->mapfile = existing;
+			lock_release (&mapfile_pool_lock);
 		}
 	else
 		{
@@ -139,8 +139,8 @@ mapfile_remove_vma (struct map_file *mapfile, struct vm_area *vma)
 	ASSERT (mapfile != NULL);
 	ASSERT (vma != NULL);
 
-	lock_acquire (&mapfile->page_pool_lock);
 	lock_acquire (&mapfile_pool_lock);
+	lock_acquire (&mapfile->page_pool_lock);
 	
 	list_remove (&vma->mapfile_elem);
 	vma->mapfile = NULL;  // Not necessary, but reassuring.
@@ -159,7 +159,10 @@ mapfile_remove_vma (struct map_file *mapfile, struct vm_area *vma)
 				 is only accessed here. More importantly, frame_free() grabs
 				 frame_table_lock, while the frame_evict() routine first grabs
 				 frame_table_lock, then the page_pool_lock for reverse mapping.
-				 Grabbing page_pool_lock here can cause a DEADLOCK. */
+				 Grabbing page_pool_lock here can cause a DEADLOCK. 
+				 Instead, frame_evict() will recognize all frames in page_pool
+				 as orphaned frames, and leave it to this routine to properly
+				 free them. */
 				
 			struct hash_iterator it;
 			hash_first (&it, &mapfile->page_pool);
@@ -259,7 +262,7 @@ mapfile_get_page (struct map_file *mapfile, off_t offset, size_t read_bytes,
 			if (f != NULL)
 				{
 					/* NOTE: This section involves difficult synchronization. 
-						 Before releasing page_pool_lock, we set the frame busy, and
+						 Before releasing page_pool_lock, we set the frame BUSY, and
 						 add it to page_pool. After releasing, subsequent PFs using this
 						 pool can happen, and if they fetch this very frame, they fail
 						 the BUSY bit check and start again. 
@@ -273,10 +276,10 @@ mapfile_get_page (struct map_file *mapfile, off_t offset, size_t read_bytes,
 						 reversed order, causing a DEADLOCK! */
 						
 					frame_set_busy (f);
-					/* Not until here could frame_evict() find this frame not empty. But
-					   it is still BUSY, and not possibly evicted. */
 					if (thread_current ()->want_pinned)
 						frame_set_pinned (f);
+					/* Not until here could frame_evict() find this frame not empty. But
+					   it is still BUSY, and not possibly evicted. */
 					frame_set_mapfile (f, mapfile);
 					frame_set_offset (f, offset);
 					frame_clear_write (f);
